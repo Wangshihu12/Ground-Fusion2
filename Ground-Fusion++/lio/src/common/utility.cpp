@@ -53,21 +53,55 @@ void subSampleFrame(std::vector<point3D> &frame, double size_voxel)
      }
 }
 
+/**
+ * [功能描述]：对点云进行网格采样，通过体素化方法降低点云密度并提取关键点
+ * 该函数使用体素网格对输入点云进行下采样，在保持点云几何特征的同时减少数据量
+ * 主要用于激光雷达里程计中的特征点提取，提高后续配准算法的计算效率
+ * 
+ * @param frame：输入的原始点云数据，包含所有待采样的3D点
+ * @param keypoints：输出的关键点容器，存储采样后的稀疏点云
+ * @param size_voxel_subsampling：体素网格的尺寸大小，决定采样的稀疏程度
+ *                                值越大采样越稀疏，值越小保留的点越多
+ */
 void gridSampling(const std::vector<point3D> &frame, std::vector<point3D> &keypoints, double size_voxel_subsampling)
 {
-     keypoints.resize(0);
-     std::vector<point3D> frame_sub;
-     frame_sub.resize(frame.size());
-     for (int i = 0; i < (int)frame_sub.size(); i++)
-     {
-          frame_sub[i] = frame[i];
-     }
-     subSampleFrame(frame_sub, size_voxel_subsampling);
-     keypoints.reserve(frame_sub.size());
-     for (int i = 0; i < (int)frame_sub.size(); i++)
-     {
-          keypoints.push_back(frame_sub[i]);
-     }
+    // ==================== 输出容器初始化 ====================
+    // 清空关键点容器，确保输出结果不受之前数据影响
+    keypoints.resize(0);
+    
+    // ==================== 创建点云副本 ====================
+    // 创建输入点云的完整副本，避免修改原始数据
+    // 这种做法确保了函数的数据安全性，原始点云保持不变
+    std::vector<point3D> frame_sub;
+    frame_sub.resize(frame.size());  // 预分配内存空间，提高效率
+    
+    // 逐点复制原始点云数据到副本中
+    for (int i = 0; i < (int)frame_sub.size(); i++)
+    {
+        frame_sub[i] = frame[i];  // 深拷贝每个点的完整信息
+    }
+    
+    // ==================== 执行体素化采样 ====================
+    // 调用核心采样函数对点云副本进行体素网格下采样
+    // subSampleFrame函数会就地修改frame_sub，移除冗余点，保留代表性点
+    // 采样策略通常是在每个体素内选择一个或几个最具代表性的点
+    subSampleFrame(frame_sub, size_voxel_subsampling);
+    
+    // ==================== 结果输出准备 ====================
+    // 为关键点容器预分配内存，避免频繁内存重分配
+    // 采样后的点数量通常远小于原始点数量
+    keypoints.reserve(frame_sub.size());
+    
+    // ==================== 采样结果转移 ====================
+    // 将采样后的所有点转移到输出容器中
+    for (int i = 0; i < (int)frame_sub.size(); i++)
+    {
+        keypoints.push_back(frame_sub[i]);  // 保留采样后点的所有属性信息
+    }
+    
+    // 函数执行完毕后，keypoints包含了原始点云的稀疏采样结果
+    // 这些关键点在保持原始几何结构的同时，大幅减少了数据量
+    // 为后续的点云配准、特征匹配等算法提供高效的输入数据
 }
 
 void distortFrame(std::vector<point3D> &points, Eigen::Quaterniond &q_begin, Eigen::Quaterniond &q_end, Eigen::Vector3d &t_begin, Eigen::Vector3d &t_end,

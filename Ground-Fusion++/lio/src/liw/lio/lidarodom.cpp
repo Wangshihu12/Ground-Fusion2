@@ -221,37 +221,76 @@ namespace zjloc
           cond.notify_one();
      }
 
+     /**
+      * [功能描述]：激光雷达里程计主运行函数，负责循环处理传感器测量数据
+      * 该函数是整个系统的核心运行循环，会持续等待并处理来自激光雷达、IMU等传感器的数据
+      * 通过多线程同步机制确保数据处理的时序性和完整性
+      */
      void lidarodom::run()
      {
+          // 主处理循环 - 系统会一直运行直到程序结束
           while (true)
           {
+               // 存储待处理的测量数据组，每个组包含时间同步的多传感器数据
                std::vector<MeasureGroup> measurements;
+               
+               // 获取缓冲区互斥锁，确保线程安全访问共享数据
                std::unique_lock<std::mutex> lk(mtx_buf);
+               
+               // 调试输出：等待条件变量前的状态
                // std::cout << "Before waiting for condition..." << std::endl;
+               
+               // 条件变量等待：阻塞当前线程直到有可处理的测量数据
+               // 当getMeasureMents()返回的数据大小不为0时，条件满足，线程被唤醒
                cond.wait(lk, [&]
                          { return (measurements = getMeasureMents()).size() != 0; });
-                         // std::cout << "Condition met, measurements size: " << measurements.size() << std::endl;
+               
+               // 调试输出：显示获取到的测量数据数量
+               // std::cout << "Condition met, measurements size: " << measurements.size() << std::endl;
+               
+               // 释放互斥锁，允许其他线程访问缓冲区
                lk.unlock();
 
+               // 逐个处理获取到的测量数据组
                for (auto &m : measurements)
                {
+                    // 调试输出：开始处理当前帧
                     // std::cout << "Processing frame: " << std::endl;
+                    
+                    // 使用计时器评估测量数据处理的性能
+                    // ProcessMeasurements函数执行传感器数据融合和位姿估计
                     zjloc::common::Timer::Evaluate([&]()
-                                                   { ProcessMeasurements(m); },
-                                                   "processMeasurement");
+                                                  { ProcessMeasurements(m); },
+                                                  "processMeasurement");
 
+                    // 性能监控代码块：计算数据处理速度
                     {
+                         // 获取当前实际时间（高精度时钟）
                          auto real_time = std::chrono::high_resolution_clock::now();
+                         
+                         // 静态变量：保存上一次记录的实际时间，用于计算时间差
                          static std::chrono::system_clock::time_point prev_real_time = real_time;
 
+                         // 每5秒统计一次处理速度
                          if (real_time - prev_real_time > std::chrono::seconds(5))
                          {
+                              // 获取当前处理的数据时间戳（激光雷达帧结束时间）
                               auto data_time = m.lidar_end_time_;
+                              
+                              // 静态变量：保存上一次记录的数据时间戳
                               static double prev_data_time = data_time;
+                              
+                              // 计算实际经过的时间（秒）
                               auto delta_real = std::chrono::duration_cast<std::chrono::milliseconds>(real_time - prev_real_time).count() * 0.001;
+                              
+                              // 计算仿真/数据时间的变化量（秒）
                               auto delta_sim = data_time - prev_data_time;
+                              
+                              // 计算并输出处理速度倍率（注释掉的代码）
+                              // 该倍率表示处理rosbag的速度相对于实时的倍数
                               // printf("Processing the rosbag at %.1fX speed.", delta_sim / delta_real);
 
+                              // 更新记录的时间戳，为下次计算做准备
                               prev_data_time = data_time;
                               prev_real_time = real_time;
                          }
@@ -260,248 +299,362 @@ namespace zjloc
           }
      }
 
+     /**
+      * [功能描述]：处理传感器测量数据的核心函数，执行SLAM的主要算法流程
+      * 该函数负责融合激光雷达、IMU和相机数据，进行状态预测、位姿估计和观测更新
+      * 同时处理退化场景下的传感器切换逻辑，确保系统的鲁棒性
+      * @param meas：包含时间同步的多传感器测量数据组，包括激光雷达点云、IMU数据和图像
+      */
      void lidarodom::ProcessMeasurements(MeasureGroup &meas)
      {
+          // 调试输出：开始处理测量数据
           // std::cout << "开始测试"<< std::endl;
+          
+          // 将当前测量数据组保存到成员变量中，供其他函数使用
           measures_ = meas;
 
+          // 检查IMU是否需要初始化
           if (imu_need_init_)
           {
+               // 如果IMU未初始化，则尝试初始化IMU并直接返回
                TryInitIMU();
                return;
           }
 
+          // 调试输出相关代码（已注释）
           // std::cout << ANSI_DELETE_LAST_LINE;
           // std::cout << ANSI_COLOR_GREEN << "============== process frame: "
           //           << index_frame << ANSI_COLOR_RESET << std::endl;
-          imu_states_.clear(); //   need clear here
+          
+          // 清空IMU状态缓存，为当前帧的处理做准备
+          imu_states_.clear(); // 每次处理新帧时都需要清空
 
-          // 利用IMU数据进行状态预测
+          // ==================== 状态预测阶段 ====================
+          // 使用IMU数据进行状态预测，基于运动模型推算当前时刻的状态
           zjloc::common::Timer::Evaluate([&]()
-                                         { Predict(); },
-                                         "predict");
-          //
+                                             { Predict(); },
+                                             "predict");
+          
+          // ==================== 状态初始化阶段 ====================
+          // 初始化当前帧的状态（位置、姿态等），为优化提供初值
           zjloc::common::Timer::Evaluate([&]()
-                                         { stateInitialization(); },
-                                         "state init");
+                                             { stateInitialization(); },
+                                             "state init");
 
+          // ==================== 点云数据准备 ====================
+          // 复制激光雷达点云数据，避免修改原始数据
           std::vector<point3D> const_surf;
           const_surf.insert(const_surf.end(), meas.lidar_.begin(), meas.lidar_.end());
-          // const_surf.assign(meas.lidar_.begin(), meas.lidar_.end());
+          // 备选方案：const_surf.assign(meas.lidar_.begin(), meas.lidar_.end());
 
+          // ==================== 点云帧构建 ====================
           cloudFrame *p_frame;
+          
+          // 旧版本：仅使用激光雷达数据构建帧（已注释）
           // zjloc::common::Timer::Evaluate([&]()
           //                                { p_frame = buildFrame(const_surf, current_state,
           //                                                       meas.lidar_begin_time_,
           //                                                       meas.lidar_end_time_); },
           //                                "build frame");
           
+          // 新版本：同时使用激光雷达和相机数据构建帧
           zjloc::common::Timer::Evaluate([&]()
-                                         { p_frame = buildFrame(const_surf, meas.img_, current_state,
-                                                                meas.lidar_begin_time_,
-                                                                meas.lidar_end_time_); },
-                                         "build frame");
-          
+                                             { p_frame = buildFrame(const_surf, meas.img_, current_state,
+                                                                 meas.lidar_begin_time_,
+                                                                 meas.lidar_end_time_); },
+                                             "build frame");
 
-          //   lio
+          // ==================== 位姿估计阶段 ====================
+          // 执行激光雷达里程计（LIO）优化，估计精确的位姿
           zjloc::common::Timer::Evaluate([&]()
-                                         { poseEstimation(p_frame); },
-                                         "poseEstimate");
+                                             { poseEstimation(p_frame); },
+                                             "poseEstimate");
 
-          //   观测
+          // ==================== 观测更新阶段 ====================
+          // 将LIO的结果作为观测值，更新ESKF滤波器
           SE3 pose_of_lo_ = SE3(current_state->rotation, current_state->translation);
+          
+          // 调试输出：观测值和预测值对比（已注释）
           // std::cout << "obs: " << current_state->translation.transpose() << ", " << current_state->rotation.transpose() << std::endl;
           // SE3 pred_pose = eskf_.GetNominalSE3();
           // std::cout << "pred: " << pred_pose.translation().transpose() << ", " << pred_pose.so3().log().transpose() << std::endl;
+          
+          // 使用LIO位姿观测更新ESKF，协方差分别为1e-2（位置和姿态）
           zjloc::common::Timer::Evaluate([&]()
-                                         { eskf_.ObserveSE3(pose_of_lo_, 1e-2, 1e-2); },
-                                         "eskf_obs");
+                                             { eskf_.ObserveSE3(pose_of_lo_, 1e-2, 1e-2); },
+                                             "eskf_obs");
 
+          // ==================== 数据发布和融合逻辑 ====================
           zjloc::common::Timer::Evaluate([&]()
-                                         {
-               std::string laser_topic = "laser";
-               std::string laser_topic2 = "orin_laser";
-               std::string laser_topic3 = "orin_vins";
+                                             {
+               // 定义ROS话题名称
+               std::string laser_topic = "laser";      // 主要位姿话题
+               std::string laser_topic2 = "orin_laser"; // LIO位姿话题
+               std::string laser_topic3 = "orin_vins";  // VIO位姿话题
+               
+               // 静态变量：用于记录Z轴起始位置（当前未使用）
                static double z_axis_start = 0.0; 
                static bool z_axis_recorded = false; 
 
+               // ==================== 外部里程计数据处理 ====================
+               // 如果外部里程计队列不为空，获取最接近当前时间的里程计数据
                if (!odomQueue.empty()){
                     nav_msgs::Odometry externalOdom = getClosestOdom(meas.lidar_end_time_);
-     
+
+                    // 转换ROS四元数到tf四元数
                     tf::Quaternion orientation;
                     tf::quaternionMsgToTF(externalOdom.pose.pose.orientation, orientation);
+                    
+                    // 提取外部里程计的姿态和位置
                     Eigen::Quaterniond odom_quat(orientation.w(), orientation.x(), orientation.y(), orientation.z());
                     Eigen::Vector3d odom_trans(
                               externalOdom.pose.pose.position.x,
                               externalOdom.pose.pose.position.y,
                               externalOdom.pose.pose.position.z
                          );
-     
+
+                    // 应用重力对齐变换，将外部里程计数据转换到当前坐标系
                     external_pose = SE3(Eigen::Quaterniond(R_align * odom_quat.toRotationMatrix()), R_align * odom_trans);
                }
 
+               // ==================== 退化场景处理逻辑 ====================
+               
+               // 情况1：首次检测到退化且当前仍在退化状态
                if (first_is_degenerate && is_degenerate) {
-
+                    // 首次进入退化时，计算VIO到LIO的变换关系
                     if (first_degenerate) {   
-                         text = "Switch to VIO";
-                         VIO_to_LIO = external_pose.inverse() * pose_of_lo_;
-                         first_degenerate = false;
+                         text = "Switch to VIO";  // 状态文本：切换到VIO
+                         VIO_to_LIO = external_pose.inverse() * pose_of_lo_;  // 计算变换矩阵
+                         first_degenerate = false;  // 标记已处理首次退化
                     }
-
-                    fused_pose =  external_pose * VIO_to_LIO;
+                    // 使用VIO数据和变换关系计算融合位姿
+                    fused_pose = external_pose * VIO_to_LIO;
                     pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
-               } else if (first_is_degenerate && !is_degenerate) {
-
+               } 
+               // 情况2：首次检测到退化但当前已退出退化状态
+               else if (first_is_degenerate && !is_degenerate) {
+                    // 首次退出退化时，计算LIO到融合位姿的变换关系
                     if (first_exit_degenerate) {
-                         
-                         text = "Switch to LIO";
-                         LIO_to_Fused = Last_pose_of_lo_.inverse() * fused_pose;
-
-                         first_exit_degenerate = false;
+                         text = "Switch to LIO";  // 状态文本：切换到LIO
+                         LIO_to_Fused = Last_pose_of_lo_.inverse() * fused_pose;  // 计算变换矩阵
+                         first_exit_degenerate = false;  // 标记已处理首次退出退化
                     }
-                         fused_pose = SE3(LIO_to_Fused.rotationMatrix() * pose_of_lo_.rotationMatrix(),
-                                           pose_of_lo_.translation() + LIO_to_Fused.translation());
-                         pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
+                    // 使用LIO数据和变换关系计算融合位姿
+                    fused_pose = SE3(LIO_to_Fused.rotationMatrix() * pose_of_lo_.rotationMatrix(),
+                                        pose_of_lo_.translation() + LIO_to_Fused.translation());
+                    pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
                }
 
+               // 情况3：非首次检测但当前处于退化状态
                if (!first_is_degenerate && is_degenerate) {
-
-
+                    // 首次进入退化时，计算变换偏移
                     if (first_degenerate) {
-
-                         text = "Switch to VIO";
-                         // VIO_to_Fused = Last_external_pose.inverse() * fused_pose;
-
+                         text = "Switch to VIO";  // 状态文本：切换到VIO
+                         
+                         // 分别计算位置和姿态偏移
                          Eigen::Vector3d last_translation = Last_external_pose.translation();
                          Eigen::Matrix3d last_rotation = Last_external_pose.rotationMatrix();
-
                          Eigen::Vector3d fused_translation = fused_pose.translation();
                          Eigen::Matrix3d fused_rotation = fused_pose.rotationMatrix();
-
-                         Eigen::Vector3d translation_offset = fused_translation - last_translation;
-                         Eigen::Matrix3d rotation_offset =  last_rotation.inverse() * fused_rotation;
-
-                         VIO_to_Fused = SE3(rotation_offset, translation_offset);
-                         first_degenerate = false;
                          
+                         // 计算变换偏移量
+                         Eigen::Vector3d translation_offset = fused_translation - last_translation;
+                         Eigen::Matrix3d rotation_offset = last_rotation.inverse() * fused_rotation;
+                         
+                         VIO_to_Fused = SE3(rotation_offset, translation_offset);
+                         first_degenerate = false;  // 标记已处理首次退化
                     }
-                         // fused_pose =  external_pose * VIO_to_Fused;
-                         fused_pose = SE3(external_pose.rotationMatrix() * VIO_to_Fused.rotationMatrix(),
-                                           external_pose.translation() + VIO_to_Fused.translation());
-                         pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
-               } else if (!first_is_degenerate && !is_degenerate && has_entered_degenerate) {
-
+                    // 使用VIO数据和偏移计算融合位姿
+                    fused_pose = SE3(external_pose.rotationMatrix() * VIO_to_Fused.rotationMatrix(),
+                                        external_pose.translation() + VIO_to_Fused.translation());
+                    pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
+               } 
+               // 情况4：非首次检测且当前未退化但曾经进入过退化状态
+               else if (!first_is_degenerate && !is_degenerate && has_entered_degenerate) {
+                    // 首次退出退化时，计算LIO到融合位姿的变换偏移
                     if (first_exit_degenerate) {
-                             text = "Switch to LIO";
-                             
-                         //     LIO_to_Fused = Last_pose_of_lo_.inverse() * fused_pose;
-
-                             Eigen::Vector3d last_translation = Last_pose_of_lo_.translation();
-                             Eigen::Matrix3d last_rotation = Last_pose_of_lo_.rotationMatrix();
-
-                             Eigen::Vector3d fused_translation = fused_pose.translation();
-                             Eigen::Matrix3d fused_rotation = fused_pose.rotationMatrix();
-
-                             Eigen::Vector3d translation_offset = fused_translation - last_translation;
-                             Eigen::Matrix3d rotation_offset =  last_rotation.inverse() * fused_rotation;
-
-                             LIO_to_Fused = SE3(rotation_offset, translation_offset);
-
-                         first_exit_degenerate = false;
+                         text = "Switch to LIO";  // 状态文本：切换到LIO
+                         
+                         // 分别计算位置和姿态偏移
+                         Eigen::Vector3d last_translation = Last_pose_of_lo_.translation();
+                         Eigen::Matrix3d last_rotation = Last_pose_of_lo_.rotationMatrix();
+                         Eigen::Vector3d fused_translation = fused_pose.translation();
+                         Eigen::Matrix3d fused_rotation = fused_pose.rotationMatrix();
+                         
+                         // 计算变换偏移量
+                         Eigen::Vector3d translation_offset = fused_translation - last_translation;
+                         Eigen::Matrix3d rotation_offset = last_rotation.inverse() * fused_rotation;
+                         
+                         LIO_to_Fused = SE3(rotation_offset, translation_offset);
+                         first_exit_degenerate = false;  // 标记已处理首次退出退化
                     }
-                         // fused_pose = pose_of_lo_ * LIO_to_Fused;
-                         fused_pose = SE3(pose_of_lo_.rotationMatrix() * LIO_to_Fused.rotationMatrix(),
-                                           pose_of_lo_.translation() + LIO_to_Fused.translation());
-                         pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
+                    // 使用LIO数据和偏移计算融合位姿
+                    fused_pose = SE3(pose_of_lo_.rotationMatrix() * LIO_to_Fused.rotationMatrix(),
+                                        pose_of_lo_.translation() + LIO_to_Fused.translation());
+                    pub_pose_to_ros(laser_topic, fused_pose, meas.lidar_end_time_);
                }
 
+               // ==================== 状态记录 ====================
+               // 保存当前位姿，用于下一帧的变换计算
                Last_pose_of_lo_ = pose_of_lo_;
                Last_external_pose = external_pose;
-               // prev_is_degenerate = is_degenerate;
 
-               if (!entered_degenerate) pub_pose_to_ros(laser_topic, pose_of_lo_, meas.lidar_end_time_);
+               // ==================== 数据发布 ====================
+               // 如果从未进入退化状态，直接发布LIO位姿
+               if (!entered_degenerate) 
+                    pub_pose_to_ros(laser_topic, pose_of_lo_, meas.lidar_end_time_);
+               
+               // 发布原始LIO位姿到专用话题
                pub_pose_to_ros(laser_topic2, pose_of_lo_, meas.lidar_end_time_);
+               
+               // 发布外部VIO位姿到专用话题
                pub_pose_to_ros(laser_topic3, external_pose, meas.lidar_end_time_);
+               
+               // 发布速度信息
                laser_topic = "velocity";
-               SE3 pred_pose = eskf_.GetNominalSE3();
-               Eigen::Vector3d vel_world = eskf_.GetNominalVel();
-               Eigen::Vector3d vel_base = pred_pose.rotationMatrix().inverse()*vel_world;
-               pub_data_to_ros(laser_topic, vel_base.x(), text);
+               SE3 pred_pose = eskf_.GetNominalSE3();  // 获取预测位姿
+               Eigen::Vector3d vel_world = eskf_.GetNominalVel();  // 获取世界坐标系速度
+               Eigen::Vector3d vel_base = pred_pose.rotationMatrix().inverse() * vel_world;  // 转换到机体坐标系
+               pub_data_to_ros(laser_topic, vel_base.x(), text);  // 发布X方向速度
+               
+               // 发布状态文本信息
                laser_topic = "text";
-               // std::cout << "Text content: " << text << std::endl;
                pub_data_to_ros(laser_topic, 0, text);
-               if(index_frame%8==0)
+               
+               // 每8帧发布一次累计距离信息
+               if(index_frame % 8 == 0)
                {
                     laser_topic = "dist";
-                    static Eigen::Vector3d last_t = Eigen::Vector3d::Zero();
-                    Eigen::Vector3d t = pred_pose.translation();
-                    static double dist = 0;
-                    dist += (t - last_t).norm();
-                    last_t = t;
-                    pub_data_to_ros(laser_topic, dist, text);
-                    // std::cout << eskf_.GetGravity().transpose() << std::endl;
-               } },
-                                         "pub cloud");
+                    static Eigen::Vector3d last_t = Eigen::Vector3d::Zero();  // 上次位置记录
+                    Eigen::Vector3d t = pred_pose.translation();  // 当前位置
+                    static double dist = 0;  // 累计距离
+                    dist += (t - last_t).norm();  // 累加距离增量
+                    last_t = t;  // 更新位置记录
+                    pub_data_to_ros(laser_topic, dist, text);  // 发布累计距离
+               } 
+          }, "pub cloud");  // 计时器名称
 
+          // ==================== 状态保存和内存管理 ====================
+          // 为当前帧保存状态副本
           p_frame->p_state = new state(current_state, true);
-          // all_cloud_frame.push_back(p_frame); //   TODO:     保存这个，特别费内存
+          
+          // 保存状态到历史记录（注释的版本会消耗大量内存）
+          // all_cloud_frame.push_back(p_frame); // TODO: 保存这个，特别费内存
+          
+          // 创建状态副本并保存到历史记录
           state *tmp_state = new state(current_state, true);
           all_state_frame.push_back(tmp_state);
+          
+          // 为下一帧创建新的当前状态
           current_state = new state(current_state, false);
 
-          index_frame++;
-          p_frame->release();
+          // ==================== 清理工作 ====================
+          index_frame++;  // 帧计数器递增
+          p_frame->release();  // 释放帧资源
+          
+          // 清空临时容器，释放内存
           std::vector<point3D>().swap(meas.lidar_);
           std::vector<point3D>().swap(const_surf);
      }
 
+     /**
+      * [功能描述]：激光雷达里程计位姿估计的主函数
+      * 该函数是位姿估计流程的核心入口，负责协调优化、地图更新和视场管理三个关键步骤
+      * 通过非线性优化算法精确估计当前帧的位姿，并维护局部地图的一致性和有效性
+      * @param p_frame：当前点云帧指针，包含待处理的激光雷达数据和状态信息
+      */
      void lidarodom::poseEstimation(cloudFrame *p_frame)
      {
-          //   TODO: check current_state data
+          // TODO: 检查current_state数据的有效性（待实现的功能）
+          // 未来可以在此处添加状态数据的完整性和合理性检查
+          
+          // ==================== 位姿优化阶段 ====================
+          // 跳过第一帧的优化处理，因为第一帧没有足够的历史信息进行配准
+          // 从第二帧开始执行基于点云配准的位姿优化算法
           if (index_frame > 1)
           {
+               // 使用计时器评估优化过程的性能开销
+               // optimize函数执行点到平面的ICP配准优化，精确估计位姿参数
                zjloc::common::Timer::Evaluate([&]()
-                                              { optimize(p_frame); },
-                                              "optimize");
+                                             { optimize(p_frame); },
+                                             "optimize");
           }
 
+          // ==================== 地图更新控制 ====================
+          // 控制变量：决定是否将当前帧的点云数据添加到局部地图中
+          // 设置为true表示启用增量式地图构建
           bool add_points = true;
+          
+          // ==================== 增量式地图更新 ====================
+          // 如果启用地图更新，则将优化后的点云数据集成到局部地图中
           if (add_points)
-          { //   update map here
+          { 
+               // 地图更新注释：在此处更新局部地图
+               // 使用计时器评估地图更新过程的性能开销
+               // map_incremental函数负责将当前帧的点云增量添加到体素地图中
+               // 采用体素化方法管理地图数据，确保内存效率和查询速度
                zjloc::common::Timer::Evaluate([&]()
-                                              { map_incremental(p_frame); },
-                                              "map update");
+                                             { map_incremental(p_frame); },
+                                             "map update");
           }
 
+          // ==================== 视场范围管理 ====================
+          // 使用计时器评估视场分割过程的性能开销
+          // lasermap_fov_segment函数负责维护局部地图的有效范围
+          // 移除超出传感器有效距离的远距离点云，控制地图大小和计算复杂度
+          // 这是一种滑动窗口式的地图管理策略，确保系统的实时性能
           zjloc::common::Timer::Evaluate([&]()
-                                         { lasermap_fov_segment(); },
-                                         "fov segment");
+                                             { lasermap_fov_segment(); },
+                                             "fov segment");
      }
 
+     /**
+      * [功能描述]：激光雷达里程计的核心优化函数
+      * 该函数使用基于Ceres的非线性优化算法，通过点到平面的ICP配准精确估计位姿
+      * 支持连续时间ICP（CT-ICP）和传统ICP两种模式，并包含多种正则化约束确保优化稳定性
+      * 同时检测和处理环境退化情况，提高系统在挑战性场景下的鲁棒性
+      * @param p_frame：当前点云帧指针，包含待优化的激光雷达数据和初始状态估计
+      */
      void lidarodom::optimize(cloudFrame *p_frame)
      {
-
+          // ==================== 历史状态信息获取 ====================
+          // 初始化前一帧状态相关变量，用于添加时间一致性约束
           state *previous_state = nullptr;
-          Eigen::Vector3d previous_translation = Eigen::Vector3d::Zero();
-          Eigen::Vector3d previous_velocity = Eigen::Vector3d::Zero();
-          Eigen::Quaterniond previous_orientation = Eigen::Quaterniond::Identity();
+          Eigen::Vector3d previous_translation = Eigen::Vector3d::Zero();  // 前一帧位置
+          Eigen::Vector3d previous_velocity = Eigen::Vector3d::Zero();     // 前一帧速度
+          Eigen::Quaterniond previous_orientation = Eigen::Quaterniond::Identity();  // 前一帧姿态
 
+          // ==================== 当前帧状态初始化 ====================
+          // 获取当前帧的状态指针和初始位姿估计
           state *curr_state = p_frame->p_state;
+          
+          // 提取帧开始和结束时刻的姿态四元数（用于CT-ICP）
           Eigen::Quaterniond begin_quat = Eigen::Quaterniond(curr_state->rotation_begin);
           Eigen::Quaterniond end_quat = Eigen::Quaterniond(curr_state->rotation);
+          
+          // 提取帧开始和结束时刻的位置向量（用于CT-ICP）
           Eigen::Vector3d begin_t = curr_state->translation_begin;
           Eigen::Vector3d end_t = curr_state->translation;
 
+          // ==================== 前一帧状态信息提取 ====================
+          // 如果不是第一帧，则获取前一帧的状态信息用于时间一致性约束
           if (p_frame->frame_id > 1)
           {
+               // 调试输出：显示状态帧数量和当前帧ID
                if (options_.log_print)
                     std::cout << "all_cloud_frame.size():" << all_state_frame.size() << ", " << p_frame->frame_id << std::endl;
-               // previous_state = all_cloud_frame[p_frame->frame_id - 2]->p_state;
-               previous_state = all_state_frame[p_frame->frame_id - 2];
-               previous_translation = previous_state->translation;
-               previous_velocity = previous_state->translation - previous_state->translation_begin;
-               previous_orientation = previous_state->rotation;
+               
+               // 获取前一帧的状态（索引为当前帧ID-2，因为索引从0开始）
+               // previous_state = all_cloud_frame[p_frame->frame_id - 2]->p_state;  // 旧版本使用点云帧历史
+               previous_state = all_state_frame[p_frame->frame_id - 2];  // 新版本使用状态帧历史
+               
+               // 提取前一帧的关键信息
+               previous_translation = previous_state->translation;  // 前一帧结束位置
+               previous_velocity = previous_state->translation - previous_state->translation_begin;  // 前一帧运动速度
+               previous_orientation = previous_state->rotation;  // 前一帧结束姿态
           }
+          
+          // 调试输出：显示前一帧和当前帧的位置信息
           if (options_.log_print)
           {
                std::cout << "prev end: " << previous_translation.transpose() << std::endl;
@@ -509,134 +662,191 @@ namespace zjloc
                          << "\ncurr end: " << p_frame->p_state->translation.transpose() << std::endl;
           }
 
+          // ==================== 关键点采样 ====================
+          // 对表面点进行网格采样，减少计算量同时保持特征完整性
           std::vector<point3D> surf_keypoints;
           gridSampling(p_frame->point_surf, surf_keypoints,
-                       options_.sampling_rate * options_.surf_res);
+                         options_.sampling_rate * options_.surf_res);
 
+          // 记录原始点云大小（用于调试）
           size_t num_size = p_frame->point_surf.size();
 
+          // ==================== 点云变换函数定义 ====================
+          // Lambda函数：根据优化后的位姿参数变换关键点到世界坐标系
           auto transformKeypoints = [&](std::vector<point3D> &point_frame)
           {
-               Eigen::Matrix3d R;
-               Eigen::Vector3d t;
+               Eigen::Matrix3d R;  // 旋转矩阵
+               Eigen::Vector3d t;  // 平移向量
+               
+               // 遍历所有关键点进行坐标变换
                for (auto &keypoint : point_frame)
                {
+                    // ==================== CT-ICP模式：考虑运动畸变 ====================
+                    // 如果启用运动补偿或使用连续时间ICP模型
                     if (options_.point_to_plane_with_distortion ||
-                        options_.icpmodel == IcpModel::CT_POINT_TO_PLANE)
+                         options_.icpmodel == IcpModel::CT_POINT_TO_PLANE)
                     {
+                         // 获取该点的时间插值系数（0表示帧开始，1表示帧结束）
                          double alpha_time = keypoint.alpha_time;
 
+                         // 使用球面线性插值（SLERP）计算该时刻的姿态
                          Eigen::Quaterniond q = begin_quat.slerp(alpha_time, end_quat);
-                         q.normalize();
-                         R = q.toRotationMatrix();
+                         q.normalize();  // 归一化四元数
+                         R = q.toRotationMatrix();  // 转换为旋转矩阵
+                         
+                         // 使用线性插值计算该时刻的位置
                          t = (1.0 - alpha_time) * begin_t + alpha_time * end_t;
                     }
+                    // ==================== 传统ICP模式：不考虑运动畸变 ====================
                     else
                     {
+                         // 直接使用帧结束时刻的位姿
                          R = end_quat.normalized().toRotationMatrix();
                          t = end_t;
                     }
+                    
+                    // 应用坐标变换：激光雷达坐标系 -> IMU坐标系 -> 世界坐标系
                     keypoint.point = R * (TIL_ * keypoint.raw_point) + t;
                }
           };
 
+          // ==================== 主优化循环 ====================
+          // 迭代优化，逐步精确位姿估计
           for (int iter(0); iter < options_.max_num_iteration; iter++)
           {
+               // ==================== 点云变换 ====================
+               // 使用当前位姿估计变换关键点
                transformKeypoints(surf_keypoints);
 
-               // ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1 / (1.5e-3));
+               // ==================== Ceres优化问题设置 ====================
+               // 设置Huber损失函数，对异常值具有鲁棒性
+               // ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1 / (1.5e-3));  // 备选参数
                ceres::LossFunction *loss_function = new ceres::HuberLoss(0.5);
+               
+               // 创建Ceres优化问题
                ceres::Problem::Options problem_options;
                ceres::Problem problem(problem_options);
-#ifdef USE_ANALYTICAL_DERIVATE
+               
+               // 选择四元数参数化方式
+          #ifdef USE_ANALYTICAL_DERIVATE
+               // 使用自定义的旋转参数化（解析导数）
                ceres::LocalParameterization *parameterization = new RotationParameterization();
-#else
+          #else
+               // 使用Eigen四元数参数化（自动微分）
                auto *parameterization = new ceres::EigenQuaternionParameterization();
-#endif
+          #endif
 
+               // ==================== 参数块添加 ====================
+               // 根据ICP模型类型添加不同的优化参数
                switch (options_.icpmodel)
                {
                case IcpModel::CT_POINT_TO_PLANE:
-                    problem.AddParameterBlock(&begin_quat.x(), 4, parameterization);
-                    problem.AddParameterBlock(&end_quat.x(), 4, parameterization);
-                    problem.AddParameterBlock(&begin_t.x(), 3);
-                    problem.AddParameterBlock(&end_t.x(), 3);
+                    // CT-ICP模式：优化帧开始和结束的位姿（6个参数块）
+                    problem.AddParameterBlock(&begin_quat.x(), 4, parameterization);  // 开始姿态
+                    problem.AddParameterBlock(&end_quat.x(), 4, parameterization);    // 结束姿态
+                    problem.AddParameterBlock(&begin_t.x(), 3);                       // 开始位置
+                    problem.AddParameterBlock(&end_t.x(), 3);                         // 结束位置
                     break;
                case IcpModel::POINT_TO_PLANE:
-                    problem.AddParameterBlock(&end_quat.x(), 4, parameterization);
-                    problem.AddParameterBlock(&end_t.x(), 3);
+                    // 传统ICP模式：仅优化帧结束的位姿（2个参数块）
+                    problem.AddParameterBlock(&end_quat.x(), 4, parameterization);    // 结束姿态
+                    problem.AddParameterBlock(&end_t.x(), 3);                         // 结束位置
                     break;
                }
 
-               std::vector<ceres::CostFunction *> surfFactor;
-               std::vector<Eigen::Vector3d> normalVec;
+               // ==================== 点到平面距离残差项 ====================
+               // 构建表面点的点到平面距离约束
+               std::vector<ceres::CostFunction *> surfFactor;  // 存储代价函数
+               std::vector<Eigen::Vector3d> normalVec;         // 存储平面法向量
                addSurfCostFactor(surfFactor, normalVec, surf_keypoints, p_frame);
 
+               // 检查是否为最后一次迭代和提前退出条件
                bool is_last_iteration = (iter == options_.max_num_iteration - 1);
                bool is_exit_condition_met = false;
 
-               int surf_num = 0;
+               // ==================== 添加残差块到优化问题 ====================
+               int surf_num = 0;  // 残差计数器
                if (options_.log_print)
                     std::cout << "get factor: " << surfFactor.size() << std::endl;
+                    
+               // 逐个添加表面点残差
                for (auto &e : surfFactor)
                {
                     surf_num++;
                     switch (options_.icpmodel)
                     {
                     case IcpModel::CT_POINT_TO_PLANE:
+                         // CT-ICP：残差依赖于开始和结束位姿
                          problem.AddResidualBlock(e, loss_function, &begin_t.x(), &begin_quat.x(), &end_t.x(), &end_quat.x());
                          break;
                     case IcpModel::POINT_TO_PLANE:
+                         // 传统ICP：残差仅依赖于结束位姿
                          problem.AddResidualBlock(e, loss_function, &end_t.x(), &end_quat.x());
                          break;
                     }
+                    // 可选：限制最大残差数量（当前已注释）
                     // if (surf_num > options_.max_num_residuals)
                     //      break;
                }
                          
-               //   release
-               // std::vector<Eigen::Vector3d>().swap(normalVec);
+               // 释放临时容器内存
+               // std::vector<Eigen::Vector3d>().swap(normalVec);  // 暂时不释放，后续需要用于退化检测
                std::vector<ceres::CostFunction *>().swap(surfFactor);
 
+               // ==================== 正则化约束项（仅CT-ICP模式）====================
                if (options_.icpmodel == IcpModel::CT_POINT_TO_PLANE)
                {
-                    if (options_.beta_location_consistency > 0.) //   location consistency
+                    // ==================== 位置一致性约束 ====================
+                    // 约束当前帧开始位置与前一帧结束位置的差异
+                    if (options_.beta_location_consistency > 0.)
                     {
-#ifdef USE_ANALYTICAL_DERIVATE
+          #ifdef USE_ANALYTICAL_DERIVATE
+                         // 使用解析导数的位置一致性因子
                          CT_ICP::LocationConsistencyFactor *cost_location_consistency =
-                             new CT_ICP::LocationConsistencyFactor(previous_translation, sqrt(surf_num * options_.beta_location_consistency * laser_point_cov));
-#else
+                              new CT_ICP::LocationConsistencyFactor(previous_translation, sqrt(surf_num * options_.beta_location_consistency * laser_point_cov));
+          #else
+                         // 使用自动微分的位置一致性因子
                          auto *cost_location_consistency =
-                             CT_ICP::LocationConsistencyFunctor::Create(previous_translation, sqrt(surf_num * options_.beta_location_consistency));
-#endif
+                              CT_ICP::LocationConsistencyFunctor::Create(previous_translation, sqrt(surf_num * options_.beta_location_consistency));
+          #endif
                          problem.AddResidualBlock(cost_location_consistency, nullptr, &begin_t.x());
                     }
 
-                    if (options_.beta_orientation_consistency > 0.) // orientation consistency
+                    // ==================== 姿态一致性约束 ====================
+                    // 约束当前帧开始姿态与前一帧结束姿态的差异
+                    if (options_.beta_orientation_consistency > 0.)
                     {
-#ifdef USE_ANALYTICAL_DERIVATE
+          #ifdef USE_ANALYTICAL_DERIVATE
+                         // 使用解析导数的姿态一致性因子
                          CT_ICP::RotationConsistencyFactor *cost_rotation_consistency =
-                             new CT_ICP::RotationConsistencyFactor(previous_orientation, sqrt(surf_num * options_.beta_orientation_consistency * laser_point_cov));
-#else
+                              new CT_ICP::RotationConsistencyFactor(previous_orientation, sqrt(surf_num * options_.beta_orientation_consistency * laser_point_cov));
+          #else
+                         // 使用自动微分的姿态一致性因子
                          auto *cost_rotation_consistency =
-                             CT_ICP::OrientationConsistencyFunctor::Create(previous_orientation, sqrt(surf_num * options_.beta_orientation_consistency));
-#endif
+                              CT_ICP::OrientationConsistencyFunctor::Create(previous_orientation, sqrt(surf_num * options_.beta_orientation_consistency));
+          #endif
                          problem.AddResidualBlock(cost_rotation_consistency, nullptr, &begin_quat.x());
                     }
 
-                    if (options_.beta_small_velocity > 0.) //     small velocity
+                    // ==================== 小速度约束 ====================
+                    // 约束帧内运动速度，防止过度运动
+                    if (options_.beta_small_velocity > 0.)
                     {
-#ifdef USE_ANALYTICAL_DERIVATE
+          #ifdef USE_ANALYTICAL_DERIVATE
+                         // 使用解析导数的小速度因子
                          CT_ICP::SmallVelocityFactor *cost_small_velocity =
-                             new CT_ICP::SmallVelocityFactor(sqrt(surf_num * options_.beta_small_velocity * laser_point_cov));
-#else
+                              new CT_ICP::SmallVelocityFactor(sqrt(surf_num * options_.beta_small_velocity * laser_point_cov));
+          #else
+                         // 使用自动微分的小速度因子
                          auto *cost_small_velocity =
-                             CT_ICP::SmallVelocityFunctor::Create(sqrt(surf_num * options_.beta_small_velocity));
-#endif
+                              CT_ICP::SmallVelocityFunctor::Create(sqrt(surf_num * options_.beta_small_velocity));
+          #endif
                          problem.AddResidualBlock(cost_small_velocity, nullptr, &begin_t.x(), &end_t.x());
                     }
 
-                    // if (options_.beta_constant_velocity > 0.) //  const velocity
+                    // ==================== 常速度约束（已注释）====================
+                    // 可选：约束当前帧速度与前一帧速度的一致性
+                    // if (options_.beta_constant_velocity > 0.)
                     // {
                     //      CT_ICP::VelocityConsistencyFactor2 *cost_velocity_consistency =
                     //          new CT_ICP::VelocityConsistencyFactor2(previous_velocity, sqrt(surf_num * options_.beta_constant_velocity * laser_point_cov));
@@ -644,6 +854,8 @@ namespace zjloc
                     // }
                }
 
+               // ==================== 残差数量检查 ====================
+               // 确保有足够的约束进行优化
                if (surf_num < options_.min_num_residuals)
                {
                     std::stringstream ss_out;
@@ -652,12 +864,14 @@ namespace zjloc
                     std::cout << "ERROR: " << ss_out.str();
                }
 
+               // ==================== Ceres求解器配置 ====================
                ceres::Solver::Options options;
-               options.max_num_iterations = 5;
-               options.num_threads = 3;
-               options.minimizer_progress_to_stdout = false;
-               options.trust_region_strategy_type = ceres::TrustRegionStrategyType::LEVENBERG_MARQUARDT;
+               options.max_num_iterations = 5;  // 最大内部迭代次数
+               options.num_threads = 3;         // 并行线程数
+               options.minimizer_progress_to_stdout = false;  // 不打印进度
+               options.trust_region_strategy_type = ceres::TrustRegionStrategyType::LEVENBERG_MARQUARDT;  // LM算法
 
+               // 备选求解器配置（已注释）
                // ceres::Solver::Options options;
                // options.linear_solver_type = ceres::DENSE_SCHUR;
                // options.trust_region_strategy_type = ceres::DOGLEG;
@@ -665,68 +879,90 @@ namespace zjloc
                // options.minimizer_progress_to_stdout = false;
                // options.num_threads = 6;
 
+               // ==================== 执行优化求解 ====================
                ceres::Solver::Summary summary;
-
                ceres::Solve(options, &problem, &summary);
 
+               // 检查求解是否成功
                if (!summary.IsSolutionUsable())
                {
                     std::cout << summary.FullReport() << std::endl;
                     throw std::runtime_error("Error During Optimization");
                }
 
+               // ==================== 四元数归一化 ====================
+               // 确保四元数的单位长度约束
                begin_quat.normalize();
                end_quat.normalize();
 
+               // ==================== 收敛性检查 ====================
+               // 计算位姿变化量，判断是否收敛
                double diff_trans = 0, diff_rot = 0;
+               
+               // 计算位置变化量
                diff_trans += (current_state->translation_begin - begin_t).norm();
-               diff_rot += AngularDistance(current_state->rotation_begin, begin_quat);
-
                diff_trans += (current_state->translation - end_t).norm();
+               
+               // 计算姿态变化量（角距离）
+               diff_rot += AngularDistance(current_state->rotation_begin, begin_quat);
                diff_rot += AngularDistance(current_state->rotation, end_quat);
 
+               // 检查是否满足收敛条件
                if (diff_rot < options_.thres_orientation_norm &&
                     diff_trans < options_.thres_translation_norm)
                {
-                     // if (options_.log_print)
-                     //      std::cout << "Optimization: Finished with N=" << iter << " ICP iterations" << std::endl;
-                     // break;
-                     is_exit_condition_met = true;
+                    // 满足收敛条件，标记可以提前退出
+                    // if (options_.log_print)
+                    //      std::cout << "Optimization: Finished with N=" << iter << " ICP iterations" << std::endl;
+                    // break;
+                    is_exit_condition_met = true;
                }
 
+               // ==================== 退化检测（在最后一次迭代或收敛时）====================
                if (is_last_iteration || is_exit_condition_met) {
-                    // if (checkLocalizability(surf_keypoints, normalVec) == 1)                
+                    // 使用平面法向量检测环境的可定位性
+                    // if (checkLocalizability(surf_keypoints, normalVec) == 1)  // 旧版本同时检查关键点
                     if (checkLocalizability(normalVec) == 1) 
                     {
-                      is_degenerate = true;
-                      entered_degenerate = true;
-                      // if (!prev_is_degenerate) {
-                      if (!prev_is_degenerate) {
-                           if (!has_entered_degenerate) {
-                                first_is_degenerate = true;
-                                has_entered_degenerate = true;
-                              } else first_is_degenerate = false;
-                           first_degenerate = true;
-                          // std::cout << "Setting first_degenerate to true: "
-                          //           << "prev_is_degenerate: " << prev_is_degenerate
-                          //           << ", has_entered_degenerate: " << has_entered_degenerate
-                          //           << std::endl;
+                         // 检测到退化情况
+                         is_degenerate = true;          // 当前状态为退化
+                         entered_degenerate = true;     // 标记已进入退化状态
+                         
+                         // 处理首次退化的标志设置
+                         if (!prev_is_degenerate) {
+                              if (!has_entered_degenerate) {
+                              first_is_degenerate = true;      // 系统首次检测到退化
+                              has_entered_degenerate = true;   // 系统已经历退化
+                              } else {
+                              first_is_degenerate = false;     // 非首次进入退化状态
+                              }
+                              first_degenerate = true;  // 首次从正常状态进入退化状态
+                              
+                              // 调试输出（已注释）
+                              // std::cout << "Setting first_degenerate to true: "
+                              //           << "prev_is_degenerate: " << prev_is_degenerate
+                              //           << ", has_entered_degenerate: " << has_entered_degenerate
+                              //           << std::endl;
                          }
                     }
                     else {
-                       is_degenerate = false;
-                       if (prev_is_degenerate) {
-                         first_exit_degenerate = true;
-                       }
+                         // 未检测到退化
+                         is_degenerate = false;
+                         if (prev_is_degenerate) {
+                              first_exit_degenerate = true;  // 首次从退化状态退出
+                         }
                     }
-                    prev_is_degenerate = is_degenerate;
+                    prev_is_degenerate = is_degenerate;  // 更新前一状态记录
                }
                
-               //release
+               // 释放法向量内存
                std::vector<Eigen::Vector3d>().swap(normalVec);
 
+               // ==================== 状态更新 ====================
+               // 将优化后的参数更新到状态变量中
                if (options_.icpmodel == IcpModel::CT_POINT_TO_PLANE)
                {
+                    // CT-ICP模式：更新帧开始和结束的完整状态
                     p_frame->p_state->translation_begin = begin_t;
                     p_frame->p_state->rotation_begin = begin_quat;
                     p_frame->p_state->translation = end_t;
@@ -739,6 +975,7 @@ namespace zjloc
                }
                if (options_.icpmodel == IcpModel::POINT_TO_PLANE)
                {
+                    // 传统ICP模式：仅更新帧结束状态
                     p_frame->p_state->translation = end_t;
                     p_frame->p_state->rotation = end_quat;
 
@@ -746,24 +983,28 @@ namespace zjloc
                     current_state->rotation = end_quat;
                }
 
-               // if (diff_rot < options_.thres_orientation_norm &&
-               //     diff_trans < options_.thres_translation_norm){
+               // ==================== 收敛退出检查 ====================
+               // 如果满足收敛条件，则提前退出优化循环
                if (is_exit_condition_met) {
                     if (options_.log_print)
                          std::cout << "Optimization: Finished with N=" << iter << " ICP iterations" << std::endl;
                     break;
-                    // is_exit_condition_met = true;
                }
           }     
 
+          // ==================== 清理和调试输出 ====================
+          // 释放关键点内存
           std::vector<point3D>().swap(surf_keypoints);
+          
+          // 调试输出：显示优化后的位姿
           if (options_.log_print)
           {
                std::cout << "opt: " << p_frame->p_state->translation_begin.transpose()
                          << ",end: " << p_frame->p_state->translation.transpose() << std::endl;
           }
 
-          //   transpose point before added
+          // ==================== 最终点云变换 ====================
+          // 使用优化后的位姿变换所有表面点，为地图更新做准备
           transformKeypoints(p_frame->point_surf);
      }
 
@@ -1516,82 +1757,137 @@ namespace zjloc
           return p_frame;
      }
      
+     /**
+      * [功能描述]：初始化当前帧的状态，为后续的位姿估计提供初值
+      * 该函数负责设置激光雷达帧开始和结束时刻的位姿初值
+      * 对于前两帧使用外部里程计或IMU数据初始化，对于后续帧使用历史状态和IMU预测
+      */
      void lidarodom::stateInitialization()
      {
+          // 重力对齐矩阵计算（当前已注释，在构造函数中计算）
           // Eigen::Matrix3d R_align = computeGravityAlignment(g_odom, g_imu);
 
-          if (index_frame < 2) //   only first frame 2 //50-3.53
+          // ==================== 系统初始化阶段（前两帧）====================
+          // 只对前两帧进行特殊的初始化处理，建立系统的初始位姿基准
+          if (index_frame < 2) // 仅处理第1帧和第2帧 
           {
-               if (!odomQueue.empty()){        ///世界系相同，但是初始化得到的初始位姿不同！！！！
+               // ==================== 使用外部里程计数据初始化 ====================
+               // 如果外部里程计队列不为空，优先使用外部里程计数据进行初始化
+               if (!odomQueue.empty()){        
+                    /// 注意：世界坐标系相同，但初始化得到的初始位姿可能不同
+                    
+                    // ==================== 查找帧开始时刻对应的里程计数据 ====================
+                    // 检查队列首个数据的时间戳是否晚于帧开始时间
                     if(!odomQueue.front().header.stamp.toSec() > time_begin){
+                         // 使用二分查找找到第一个时间戳不小于帧开始时间的里程计数据
                          auto it = std::lower_bound(
                                         odomQueue.begin(), odomQueue.end(), time_begin,
                                         [](const nav_msgs::Odometry &odom, double time) {
                                         return odom.header.stamp.toSec() < time;});
                     
+                         // 如果找到了有效的里程计数据
                          if (it != odomQueue.end()) {
-                              startOdomMsg = *it;
-                       
+                              startOdomMsg = *it;  // 保存开始时刻的里程计消息
+                    
+                              // ==================== 四元数转换和姿态提取 ====================
+                              // 将ROS四元数转换为tf四元数格式
                               tf::Quaternion orientation;
                               tf::quaternionMsgToTF(startOdomMsg.pose.pose.orientation, orientation);
+                              
+                              // 提取欧拉角（当前代码中声明但未使用）
                               double roll, pitch, yaw;
                               tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
 
+                              // 转换为Eigen四元数和位置向量
                               Eigen::Quaterniond odom_quat(orientation.w(), orientation.x(), orientation.y(), orientation.z());
                               Eigen::Vector3d odom_trans(
-                                                   startOdomMsg.pose.pose.position.x,
-                                                   startOdomMsg.pose.pose.position.y,
-                                                   startOdomMsg.pose.pose.position.z);
+                                                  startOdomMsg.pose.pose.position.x,
+                                                  startOdomMsg.pose.pose.position.y,
+                                                  startOdomMsg.pose.pose.position.z);
                               
+                              // ==================== 应用重力对齐变换 ====================
+                              // 将外部里程计的姿态和位置转换到当前坐标系
                               current_state->rotation_begin = Eigen::Quaterniond(R_align * odom_quat.toRotationMatrix());
                               current_state->translation_begin = R_align * odom_trans;
                          }
                     }
+                    
+                    // ==================== 查找帧结束时刻对应的里程计数据 ====================
+                    // 检查队列末尾数据的时间戳是否早于帧结束时间
                     if (!odomQueue.back().header.stamp.toSec() < time_curr){
+                         // 使用二分查找找到第一个时间戳不小于帧结束时间的里程计数据
                          auto it = std::lower_bound(odomQueue.begin(), odomQueue.end(), time_curr,
-                           [](const nav_msgs::Odometry &odom, double time) {
-                               return odom.header.stamp.toSec() < time;
-                           });
+                         [](const nav_msgs::Odometry &odom, double time) {
+                              return odom.header.stamp.toSec() < time;
+                         });
 
+                         // 如果找到了有效的里程计数据
                          if (it != odomQueue.end()) {
-                            endOdomMsg = *it;
+                         endOdomMsg = *it;  // 保存结束时刻的里程计消息
 
-                            tf::Quaternion orientation;
-                            tf::quaternionMsgToTF(endOdomMsg.pose.pose.orientation, orientation);
-                            Eigen::Quaterniond odom_quat(orientation.w(), orientation.x(), orientation.y(), orientation.z());
-                            Eigen::Vector3d odom_trans(
-                                    endOdomMsg.pose.pose.position.x,
-                                    endOdomMsg.pose.pose.position.y,
-                                    endOdomMsg.pose.pose.position.z);
+                         // ==================== 姿态和位置提取 ====================
+                         // 将ROS四元数转换为tf四元数格式
+                         tf::Quaternion orientation;
+                         tf::quaternionMsgToTF(endOdomMsg.pose.pose.orientation, orientation);
                          
-                            current_state->rotation = Eigen::Quaterniond(R_align * odom_quat.toRotationMatrix());
-                            current_state->translation = R_align * odom_trans;
+                         // 转换为Eigen四元数和位置向量
+                         Eigen::Quaterniond odom_quat(orientation.w(), orientation.x(), orientation.y(), orientation.z());
+                         Eigen::Vector3d odom_trans(
+                                   endOdomMsg.pose.pose.position.x,
+                                   endOdomMsg.pose.pose.position.y,
+                                   endOdomMsg.pose.pose.position.z);
+                         
+                         // ==================== 应用重力对齐变换 ====================
+                         // 将外部里程计的姿态和位置转换到当前坐标系
+                         current_state->rotation = Eigen::Quaterniond(R_align * odom_quat.toRotationMatrix());
+                         current_state->translation = R_align * odom_trans;
                          }
                     }
+                    
+                    // ==================== 协方差一致性检查 ====================
+                    // 通过比较协方差矩阵的第一个元素来判断开始和结束里程计数据的一致性
+                    // 如果协方差不一致，说明数据来源不同，改用IMU数据初始化
                     if (int(round(startOdomMsg.pose.covariance[0])) != int(round(endOdomMsg.pose.covariance[0]))){
+                         // 使用IMU状态序列的首尾状态进行初始化
                          current_state->rotation_begin = Eigen::Quaterniond(imu_states_.front().R_.matrix());
                          current_state->translation_begin = imu_states_.front().p_;
                          current_state->rotation = Eigen::Quaterniond(imu_states_.back().R_.matrix());
                          current_state->translation = imu_states_.back().p_; 
                     }
                }
+               // ==================== 使用IMU数据初始化（备选方案）====================
+               // 如果外部里程计队列为空，则使用IMU预测的状态进行初始化
                else{
-                       current_state->rotation_begin = Eigen::Quaterniond(imu_states_.front().R_.matrix());
-                       current_state->translation_begin = imu_states_.front().p_;
-                       current_state->rotation = Eigen::Quaterniond(imu_states_.back().R_.matrix());
-                       current_state->translation = imu_states_.back().p_;
+                         // 帧开始状态：使用IMU状态序列的第一个状态
+                         current_state->rotation_begin = Eigen::Quaterniond(imu_states_.front().R_.matrix());
+                         current_state->translation_begin = imu_states_.front().p_;
+                         
+                         // 帧结束状态：使用IMU状态序列的最后一个状态
+                         current_state->rotation = Eigen::Quaterniond(imu_states_.back().R_.matrix());
+                         current_state->translation = imu_states_.back().p_;
                }
           }
+          // ==================== 正常运行阶段（第三帧及以后）====================
+          // 对于后续帧，使用历史状态信息和IMU预测进行初始化
           else
           {
-               //   use last pose
+               // ==================== 使用上一帧的结束状态 ====================
+               // 将上一帧的结束位姿作为当前帧的开始位姿
+               // 这确保了帧间的连续性和一致性
                current_state->rotation_begin = all_state_frame[all_state_frame.size() - 1]->rotation;
                current_state->translation_begin = all_state_frame[all_state_frame.size() - 1]->translation;
+               
+               // 备选方案：使用点云帧历史（注释掉，因为内存消耗大）
                // current_state->rotation_begin = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->rotation;
                // current_state->translation_begin = all_cloud_frame[all_cloud_frame.size() - 1]->p_state->translation;
-               //   use imu predict
+               
+               // ==================== 使用IMU预测的状态 ====================
+               // 将IMU预测的最终状态作为当前帧的结束位姿初值
+               // 这为后续的优化过程提供了良好的初始估计
                current_state->rotation = Eigen::Quaterniond(imu_states_.back().R_.matrix());
                current_state->translation = imu_states_.back().p_;
+               
+               // 备选变量（注释掉）
                // current_state->rotation = q_next_end;
                // current_state->translation = t_next_end;
           }
@@ -1747,35 +2043,89 @@ namespace zjloc
           }
      }
 
+     /**
+      * [功能描述]：使用IMU数据进行状态预测的核心函数
+      * 该函数基于ESKF（误差状态卡尔曼滤波器）对系统状态进行预测更新
+      * 通过处理IMU测量数据序列，推算激光雷达帧结束时刻的精确状态
+      * 对于超出目标时间的IMU数据，采用线性插值方法获取精确时刻的IMU值
+      */
      void lidarodom::Predict()
      {
+          // 将当前ESKF的名义状态添加到状态历史序列中
+          // 这个状态作为预测的起始点，对应激光雷达帧开始时刻的状态
           imu_states_.emplace_back(eskf_.GetNominalState());
 
-          /// 对IMU状态进行预测
+          // ==================== 状态预测初始化 ====================
+          /// 获取目标预测时间（激光雷达帧结束时刻）
           double time_current = measures_.lidar_end_time_;
+          
+          // 声明临时变量用于存储上一时刻的角速度和加速度（当前代码中未使用）
           Vec3d last_gyr, last_acc;
+          
+          // ==================== IMU数据序列处理 ====================
+          // 遍历当前测量组中的所有IMU数据，按时间顺序进行状态预测
           for (auto &imu : measures_.imu_)
           {
+               // 获取当前IMU数据的时间戳
                double time_imu = imu->timestamp_;
+               
+               // ==================== 情况1：IMU时间在目标时间之前或等于目标时间 ====================
+               // 对于时间戳不超过激光雷达帧结束时间的IMU数据，直接用于状态预测
                if (imu->timestamp_ <= time_current)
                {
+                    // 初始化：如果这是第一个IMU数据，将其设置为上一个IMU数据
                     if (last_imu_ == nullptr)
                          last_imu_ = imu;
+                    
+                    // 使用当前IMU数据更新ESKF状态预测
+                    // 这会根据IMU的角速度和加速度测量值推进系统状态
                     eskf_.Predict(*imu);
+                    
+                    // 将预测后的状态添加到状态历史序列中
+                    // 用于后续的运动补偿和插值操作
                     imu_states_.emplace_back(eskf_.GetNominalState());
+                    
+                    // 更新上一个IMU数据的记录，用于后续插值计算
                     last_imu_ = imu;
                }
+               // ==================== 情况2：IMU时间超过目标时间 ====================
+               // 对于时间戳超过激光雷达帧结束时间的IMU数据，需要进行时间插值
                else
                {
+                    // ==================== 线性插值权重计算 ====================
+                    // 计算当前IMU时间与目标时间的间隔
                     double dt_1 = time_imu - time_current;
+                    
+                    // 计算目标时间与上一个IMU时间的间隔
                     double dt_2 = time_current - last_imu_->timestamp_;
-                    double w1 = dt_1 / (dt_1 + dt_2);
-                    double w2 = dt_2 / (dt_1 + dt_2);
+                    
+                    // 计算线性插值的权重系数
+                    // w1对应上一个IMU数据的权重，w2对应当前IMU数据的权重
+                    // 距离目标时间越近的数据权重越大
+                    double w1 = dt_1 / (dt_1 + dt_2);  // 上一个IMU数据的权重
+                    double w2 = dt_2 / (dt_1 + dt_2);  // 当前IMU数据的权重
+                    
+                    // ==================== IMU数据插值 ====================
+                    // 对加速度进行线性插值，获得目标时刻的精确加速度值
                     Eigen::Vector3d acc_temp = w1 * last_imu_->acce_ + w2 * imu->acce_;
+                    
+                    // 对角速度进行线性插值，获得目标时刻的精确角速度值
                     Eigen::Vector3d gyr_temp = w1 * last_imu_->gyro_ + w2 * imu->gyro_;
+                    
+                    // ==================== 创建插值IMU数据 ====================
+                    // 使用插值得到的IMU数据创建新的IMU对象
+                    // 时间戳设置为目标时间（激光雷达帧结束时间）
                     IMUPtr imu_temp = std::make_shared<zjloc::IMU>(time_current, gyr_temp, acc_temp);
+                    
+                    // 使用插值后的IMU数据进行最终的状态预测
+                    // 这确保了状态预测刚好到达激光雷达帧结束时刻
                     eskf_.Predict(*imu_temp);
+                    
+                    // 将最终预测状态添加到状态历史序列中
                     imu_states_.emplace_back(eskf_.GetNominalState());
+                    
+                    // 更新上一个IMU数据记录为插值后的数据
+                    // 这对于下一帧的处理很重要
                     last_imu_ = imu_temp;
                }
           }
