@@ -1008,12 +1008,20 @@ namespace zjloc
           transformKeypoints(p_frame->point_surf);
      }
 
+     /**
+      * [功能描述]：根据给定的时间戳，从里程计数据队列中找到时间最接近的里程计消息
+      * @param timestamp：目标时间戳，用于查找最接近时刻的里程计数据
+      * @return 返回nav_msgs::Odometry类型的里程计消息，包含位置、姿态和速度信息
+      */
      nav_msgs::Odometry lidarodom::getClosestOdom(double timestamp) {
-          // std::lock_guard<std::mutex> lock(odoLock);
-      
+          // std::lock_guard<std::mutex> lock(odoLock);  // 被注释的互斥锁，用于多线程安全
+     
+          // 初始化最接近的里程计消息变量
           nav_msgs::Odometry closestOdom;
+          // 初始化最小时间差为最大可能值
           double minTimeDiff = std::numeric_limits<double>::max();
-      
+     
+          // 被注释掉的线性搜索实现（时间复杂度O(n)）
           // for (const auto& odom : odomQueue) {
           //     double timeDiff = std::abs(odom.header.stamp.toSec() - timestamp);
           //     if (timeDiff < minTimeDiff) {
@@ -1022,31 +1030,39 @@ namespace zjloc
           //     }
           // }
 
+          // 检查里程计队列是否为空，如果为空则抛出异常
           if (odomQueue.empty()) {
                throw std::runtime_error("odomQueue is empty");
           }
-       
+     
+          // 使用二分查找算法在有序队列中查找目标时间戳位置（时间复杂度O(log n)）
+          // lower_bound返回第一个不小于目标时间戳的元素位置
           auto it = std::lower_bound(odomQueue.begin(), odomQueue.end(), timestamp,
-                                      [](const nav_msgs::Odometry& odom, double time) {
-                                          return odom.header.stamp.toSec() < time;
-                                      });
-       
+                                   [](const nav_msgs::Odometry& odom, double time) {
+                                        return odom.header.stamp.toSec() < time;  // 比较函数：里程计时间戳小于目标时间
+                                   });
+     
+          // 处理边界情况：如果迭代器指向队列末尾，说明目标时间戳大于所有里程计时间
           if (it == odomQueue.end()) {
-               closestOdom = odomQueue.back(); 
+               closestOdom = odomQueue.back();  // 返回队列中最后一个（时间最新的）里程计数据
           }
+          // 处理边界情况：如果迭代器指向队列开头，说明目标时间戳小于所有里程计时间
           if (it == odomQueue.begin()) {
-               closestOdom = odomQueue.front(); 
-          }else {
-               auto prev_it = std::prev(it);
+               closestOdom = odomQueue.front();  // 返回队列中第一个（时间最早的）里程计数据
+          } else {
+               // 一般情况：目标时间戳在队列时间范围内，需要比较前后两个里程计数据的时间差
+               auto prev_it = std::prev(it);  // 获取前一个里程计数据的迭代器
+               
+               // 比较前一个数据和当前数据与目标时间戳的绝对时间差
                if (std::abs(prev_it->header.stamp.toSec() - timestamp) <
-                   std::abs(it->header.stamp.toSec() - timestamp)) {
-                   closestOdom = *prev_it;
+               std::abs(it->header.stamp.toSec() - timestamp)) {
+               closestOdom = *prev_it;  // 前一个数据更接近目标时间
                } else {
-                   closestOdom = *it;
+               closestOdom = *it;       // 当前数据更接近目标时间
                }
           }
 
-          return closestOdom;
+          return closestOdom;  // 返回找到的最接近时间戳的里程计数据
      }
 
      Eigen::Matrix3d lidarodom::computeGravityAlignment(const Eigen::Vector3d& g_odom, const Eigen::Vector3d& g_imu) const {
@@ -1058,34 +1074,53 @@ namespace zjloc
           return rotation_vector.toRotationMatrix();
      }
 
+     /**
+      * [功能描述]：检查系统的可定位性，通过分析平面法向量的分布来判断是否处于退化场景
+      * @param planeNormals：平面法向量集合，包含从点云中提取的平面特征的法向量
+      * @return 返回值为double类型：1表示检测到退化场景，需要使用外部里程计；0表示场景正常，可以正常定位
+      */
      double lidarodom::checkLocalizability(std::vector<Eigen::Vector3d> planeNormals)
      {
+          // 静态变量：标记是否永久处于退化状态
           static bool permanently_degenerate = false; 
 
+          // 如果已经被标记为永久退化，直接返回退化状态
           if (permanently_degenerate)
           {
-             return 1;
+               return 1;
           }
           
+          // 用于存储法向量矩阵的变量
           Eigen::MatrixXd mat;
+          // 静态变量：连续退化帧计数器（暂未使用）
           static int stable_degenerate_count = 0;
+          // 静态变量：连续退出退化帧计数器（暂未使用）
           static int stable_exit_degenerate_count = 0; 
           
+          // 只有当平面法向量数量足够多（>10）时才进行退化检测
           if (planeNormals.size() > 10)
           {
+               // 初始化矩阵，行数为法向量个数，列数为3（x,y,z分量）
                mat.setZero(planeNormals.size(), 3);
+               
+               // 将所有法向量填入矩阵，每行代表一个法向量的三个分量
                for (int i = 0; i < planeNormals.size(); i++)
                {
-                    mat(i, 0) = planeNormals[i].x();
-                    mat(i, 1) = planeNormals[i].y();
-                    mat(i, 2) = planeNormals[i].z();
+                    mat(i, 0) = planeNormals[i].x();  // x分量
+                    mat(i, 1) = planeNormals[i].y();  // y分量
+                    mat(i, 2) = planeNormals[i].z();  // z分量
                }
+               
+               // 对法向量矩阵进行奇异值分解（SVD），用于分析法向量的分布特性
                Eigen::JacobiSVD<Eigen::MatrixXd> svd(planeNormals.size(), 3);
                svd.compute(mat);
 
+               // 计算退化指数：衡量最大和最小奇异值的差异程度
                double degeneracyIndex = (svd.singularValues().x() - svd.singularValues().z()) / svd.singularValues().y();
+               // 计算稀疏指数：三个奇异值的平均值，反映整体的信息量
                double SparseIndex = (svd.singularValues().x() + svd.singularValues().z() + svd.singularValues().y())/3;
 
+               // 被注释掉的调试输出和其他退化检测条件
                // if (svd.singularValues().z() < 10)
                // if (degeneracyIndex > 0.9 ){
                //    std::cout << ANSI_COLOR_YELLOW << "Low convincing result -> singular values:"
@@ -1093,11 +1128,13 @@ namespace zjloc
                //                << svd.singularValues().z() << ANSI_COLOR_RESET << std::endl;  
                // }
                // if (SparseIndex < 10 || degeneracyIndex > 0.90){ //mid360 1.5 - 3.55  //0.45 
- 
+
+               // 退化判断条件：稀疏指数小于10或最小奇异值小于7时认为处于退化场景
                if (SparseIndex < 10 || svd.singularValues().z() < 7 ){         
                // if (SparseIndex < 10 ){
                // if (svd.singularValues().z() < 4){  //avia
                // if (SparseIndex < 10){   
+                    // 被注释掉的调试输出和连续帧退化检测逻辑
                     // std::cout << ANSI_COLOR_YELLOW << "Low convincing result -> singular values:"
                     //           << svd.singularValues().x() << ", " << svd.singularValues().y() << ", "
                     //           << svd.singularValues().z() << ANSI_COLOR_RESET << std::endl;
@@ -1109,8 +1146,8 @@ namespace zjloc
                     //      return 1;
                     // }
                     // else return 0;
-                    return 1;
-               } else return 0;
+                    return 1;  // 检测到退化场景，返回1
+               } else return 0;  // 场景正常，返回0
                // }
                // else if(has_entered_degenerate){
 
@@ -1127,14 +1164,16 @@ namespace zjloc
                //      }
                // }
           }
-          else
+          else  // 平面法向量数量不足的情况
           {
+               // 输出警告信息：接收到的法向量数量过少
                std::cout << ANSI_COLOR_RED << "Too few normal vector received -> " << planeNormals.size() << ANSI_COLOR_RESET << std::endl;
+               // 设置为永久退化状态
                permanently_degenerate = true;
-               return 1;
+               return 1;  // 返回退化状态
           }
 
-          // return 0;
+          // return 0;  // 被注释掉的默认返回值
      }
 
      Neighborhood lidarodom::computeNeighborhoodDistribution(const std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> &points)

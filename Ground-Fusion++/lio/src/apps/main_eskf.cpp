@@ -144,80 +144,107 @@ void updateStatus(const std_msgs::Int32::ConstPtr &msg)
         ;
 }
 
+/**
+ * [功能描述]：激光雷达里程计主程序入口，基于ESKF算法的SLAM系统
+ * @param argc：命令行参数个数
+ * @param argv：命令行参数数组
+ * @return 程序退出状态码，0表示正常退出，-1表示初始化失败
+ */
 int main(int argc, char **argv)
 {
+    // 初始化Google日志系统
     google::InitGoogleLogging(argv[0]);
-    FLAGS_stderrthreshold = google::INFO;
-    FLAGS_colorlogtostderr = true;
-    google::ParseCommandLineFlags(&argc, &argv, true);
+    FLAGS_stderrthreshold = google::INFO;     // 设置标准错误输出的日志级别为INFO
+    FLAGS_colorlogtostderr = true;           // 启用彩色日志输出
+    google::ParseCommandLineFlags(&argc, &argv, true);  // 解析命令行参数
 
+    // 初始化ROS节点
     ros::init(argc, argv, "main");
     ros::NodeHandle nh;
 
+    // 从ROS参数服务器获取配置文件路径
     std::string config_file;
     if (nh.getParam("config_file", config_file))
     {
-        // 输出读取的 config_file 路径
+        // 成功获取配置文件路径，输出绿色提示信息
         std::cout << "\033[32m" << "config_file: " << config_file << "\033[0m" << std::endl;
     }
     else
     {
+        // 获取配置文件路径失败，输出错误信息
         ROS_ERROR("Failed to get param 'config_file'");
     }
 
-    // std::string config_file = std::string(ROOT_DIR) + "config/mapping.yaml";
+    // std::string config_file = std::string(ROOT_DIR) + "config/mapping.yaml";  // 被注释的硬编码配置文件路径
     // std::cout << ANSI_COLOR_GREEN << "config_file:" << config_file << ANSI_COLOR_RESET << std::endl;
 
+    // 创建激光雷达里程计对象并初始化
     lio = new zjloc::lidarodom();
     if (!lio->init(config_file))
     {
-        return -1;
+        return -1;  // 初始化失败，退出程序
     }
 
+    // 创建点云数据发布器
     ros::Publisher pub_scan = nh.advertise<sensor_msgs::PointCloud2>("scan", 10);
+    
+    // 定义点云发布回调函数，用于将处理后的点云数据发布到ROS话题
     auto cloud_pub_func = std::function<bool(std::string & topic_name, zjloc::CloudPtr & cloud, double time)>(
         [&](std::string &topic_name, zjloc::CloudPtr &cloud, double time)
         {
+            // 创建ROS点云消息指针
             sensor_msgs::PointCloud2Ptr cloud_ptr_output(new sensor_msgs::PointCloud2());
+            // 将PCL点云转换为ROS点云消息格式
             pcl::toROSMsg(*cloud, *cloud_ptr_output);
 
-            cloud_ptr_output->header.stamp = ros::Time().fromSec(time);
-            cloud_ptr_output->header.frame_id = "map";
+            // 设置消息头信息
+            cloud_ptr_output->header.stamp = ros::Time().fromSec(time);  // 设置时间戳
+            cloud_ptr_output->header.frame_id = "map";                   // 设置坐标系为map
+            
+            // 根据话题名称决定是否发布点云数据
             if (topic_name == "laser")
-                pub_scan.publish(*cloud_ptr_output);
+                pub_scan.publish(*cloud_ptr_output);  // 发布激光雷达点云
             else
-                ; // publisher_.publish(*cloud_ptr_output);
+                ; // publisher_.publish(*cloud_ptr_output);  // 其他点云发布器（被注释）
             return true;
         }
-
     );
 
-    ros::Publisher pubLaserOdometry = nh.advertise<nav_msgs::Odometry>("/odom", 100);
-    ros::Publisher pubLaserOdometryPath = nh.advertise<nav_msgs::Path>("/odometry_path", 5);
-    ros::Publisher puborinOdometryPath = nh.advertise<nav_msgs::Path>("/orin_odometry_path", 5);
-    ros::Publisher puborinvinsPath = nh.advertise<nav_msgs::Path>("/orin_vins_path", 5);
-    ros::Publisher pubLaserPose = nh.advertise<geometry_msgs::PoseStamped>("/laser_pose", 100);
-    ros::Publisher puborinLaserPose = nh.advertise<geometry_msgs::PoseStamped>("/orin_laser_pose", 100);
+    // 创建各种里程计和路径相关的发布器
+    ros::Publisher pubLaserOdometry = nh.advertise<nav_msgs::Odometry>("/odom", 100);                    // 激光里程计发布器
+    ros::Publisher pubLaserOdometryPath = nh.advertise<nav_msgs::Path>("/odometry_path", 5);             // 激光里程计路径发布器
+    ros::Publisher puborinOdometryPath = nh.advertise<nav_msgs::Path>("/orin_odometry_path", 5);         // Orin设备里程计路径发布器
+    ros::Publisher puborinvinsPath = nh.advertise<nav_msgs::Path>("/orin_vins_path", 5);                // Orin设备VINS路径发布器
+    ros::Publisher pubLaserPose = nh.advertise<geometry_msgs::PoseStamped>("/laser_pose", 100);         // 激光位姿发布器
+    ros::Publisher puborinLaserPose = nh.advertise<geometry_msgs::PoseStamped>("/orin_laser_pose", 100); // Orin设备激光位姿发布器
 
+    // 定义位姿发布回调函数，用于发布不同类型的位姿和里程计数据
     auto pose_pub_func = std::function<bool(std::string & topic_name, SE3 & pose, double stamp)>(
         [&](std::string &topic_name, SE3 &pose, double stamp)
         {
+            // 静态TF广播器，用于发布坐标变换
             static tf::TransformBroadcaster br;
             tf::Transform transform;
+            
+            // 从SE3位姿中提取四元数和平移向量
             Eigen::Quaterniond q_current(pose.so3().matrix());
             transform.setOrigin(tf::Vector3(pose.translation().x(), pose.translation().y(), pose.translation().z()));
             tf::Quaternion q(q_current.x(), q_current.y(), q_current.z(), q_current.w());
             transform.setRotation(q);
+            
+            // 处理激光雷达位姿数据
             if (topic_name == "laser")
             {
+                // 广播从map到base_link的坐标变换
                 br.sendTransform(tf::StampedTransform(transform, ros::Time().fromSec(stamp), "map", "base_link"));
 
-                // publish odometry
+                // 发布激光里程计消息
                 nav_msgs::Odometry laserOdometry;
                 laserOdometry.header.frame_id = "map";
                 laserOdometry.child_frame_id = "base_link";
                 laserOdometry.header.stamp = ros::Time().fromSec(stamp);
 
+                // 设置位姿信息（四元数和位置）
                 laserOdometry.pose.pose.orientation.x = q_current.x();
                 laserOdometry.pose.pose.orientation.y = q_current.y();
                 laserOdometry.pose.pose.orientation.z = q_current.z();
@@ -227,27 +254,32 @@ int main(int argc, char **argv)
                 laserOdometry.pose.pose.position.z = pose.translation().z();
                 pubLaserOdometry.publish(laserOdometry);
 
-                //  publish path
+                // 发布激光位姿和路径信息
                 geometry_msgs::PoseStamped laserPose;
                 laserPose.header = laserOdometry.header;
                 laserPose.pose = laserOdometry.pose.pose;
                 pubLaserPose.publish(laserPose);
+                
+                // 更新并发布路径信息
                 laserOdoPath.header.stamp = laserOdometry.header.stamp;
                 laserOdoPath.poses.push_back(laserPose);
                 laserOdoPath.header.frame_id = "/map";
                 pubLaserOdometryPath.publish(laserOdoPath);
             }
 
+            // 处理Orin设备激光雷达位姿数据
             if (topic_name == "orin_laser")
             {
+                // 广播从map到orin_base_link的坐标变换
                 br.sendTransform(tf::StampedTransform(transform, ros::Time().fromSec(stamp), "map", "orin_base_link"));
 
-                // publish odometry
+                // 创建Orin设备里程计消息
                 nav_msgs::Odometry orinOdometry;
                 orinOdometry.header.frame_id = "map";
                 orinOdometry.child_frame_id = "orin_base_link";
                 orinOdometry.header.stamp = ros::Time().fromSec(stamp);
 
+                // 设置Orin设备位姿信息
                 orinOdometry.pose.pose.orientation.x = q_current.x();
                 orinOdometry.pose.pose.orientation.y = q_current.y();
                 orinOdometry.pose.pose.orientation.z = q_current.z();
@@ -255,29 +287,34 @@ int main(int argc, char **argv)
                 orinOdometry.pose.pose.position.x = pose.translation().x();
                 orinOdometry.pose.pose.position.y = pose.translation().y();
                 orinOdometry.pose.pose.position.z = pose.translation().z();
-                // pubLaserOdometry.publish(laserOdometry);
+                // pubLaserOdometry.publish(laserOdometry);  // 被注释的发布语句
 
-                //  publish path
+                // 发布Orin设备位姿和路径信息
                 geometry_msgs::PoseStamped orinPose;
                 orinPose.header = orinOdometry.header;
                 orinPose.pose = orinOdometry.pose.pose;
                 puborinLaserPose.publish(orinPose);
+                
+                // 更新并发布Orin设备路径信息
                 orinOdoPath.header.stamp = orinOdometry.header.stamp;
                 orinOdoPath.poses.push_back(orinPose);
                 orinOdoPath.header.frame_id = "/map";
                 puborinOdometryPath.publish(orinOdoPath);
             }
 
+            // 处理Orin设备VINS位姿数据
             if (topic_name == "orin_vins")
             {
+                // 广播从map到orin_vins的坐标变换
                 br.sendTransform(tf::StampedTransform(transform, ros::Time().fromSec(stamp), "map", "orin_vins"));
 
-                // publish odometry
+                // 创建Orin VINS里程计消息
                 nav_msgs::Odometry orinvinsOdometry;
                 orinvinsOdometry.header.frame_id = "map";
                 orinvinsOdometry.child_frame_id = "orin_vins";
                 orinvinsOdometry.header.stamp = ros::Time().fromSec(stamp);
 
+                // 设置Orin VINS位姿信息
                 orinvinsOdometry.pose.pose.orientation.x = q_current.x();
                 orinvinsOdometry.pose.pose.orientation.y = q_current.y();
                 orinvinsOdometry.pose.pose.orientation.z = q_current.z();
@@ -285,12 +322,14 @@ int main(int argc, char **argv)
                 orinvinsOdometry.pose.pose.position.x = pose.translation().x();
                 orinvinsOdometry.pose.pose.position.y = pose.translation().y();
                 orinvinsOdometry.pose.pose.position.z = pose.translation().z();
-                // pubLaserOdometry.publish(laserOdometry);
+                // pubLaserOdometry.publish(laserOdometry);  // 被注释的发布语句
 
-                //  publish path
+                // 发布Orin VINS路径信息
                 geometry_msgs::PoseStamped orinvinsPose;
                 orinvinsPose.header = orinvinsOdometry.header;
                 orinvinsPose.pose = orinvinsOdometry.pose.pose;
+                
+                // 更新并发布Orin VINS路径信息
                 orinvinsOdoPath.header.stamp = orinvinsOdometry.header.stamp;
                 orinvinsOdoPath.poses.push_back(orinvinsPose);
                 orinvinsOdoPath.header.frame_id = "/map";
@@ -299,26 +338,27 @@ int main(int argc, char **argv)
 
             return true;
         }
-
     );
 
+    // 创建图像发布器
     ros::Publisher image_pub = nh.advertise<sensor_msgs::CompressedImage>("/img", 10);
+    
+    // 定义图像发布回调函数，用于发布压缩图像数据
     auto image_pub_func = std::function<bool(std::string& topic_name, cv::Mat image, double time)>(
         [&](std::string& topic_name, cv::Mat image, double time)
         {
-            // 1. 构造 ROS 头
+            // 1. 构造ROS消息头
             std_msgs::Header header;
             header.stamp = ros::Time().fromSec(time);
             header.frame_id = "camera";
 
-            // 2. 压缩 cv::Mat -> JPEG
+            // 2. 将cv::Mat图像压缩为JPEG格式
             std::vector<uchar> buffer;
-            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 90};
+            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 90};  // 设置JPEG压缩质量为90%
             cv::imencode(".jpg", image, buffer, params);
 
-            // 3. 填充 CompressedImage 并发布
-            sensor_msgs::CompressedImagePtr msg(
-            new sensor_msgs::CompressedImage());
+            // 3. 填充压缩图像消息并发布
+            sensor_msgs::CompressedImagePtr msg(new sensor_msgs::CompressedImage());
             msg->header = header;
             msg->format = "jpeg";
             msg->data   = std::move(buffer);
@@ -328,71 +368,86 @@ int main(int argc, char **argv)
         }
     );
 
-    ros::Publisher vel_pub = nh.advertise<std_msgs::Float32>("/velocity", 1);
-    ros::Publisher dist_pub = nh.advertise<std_msgs::Float32>("/move_dist", 1);
-    ros::Publisher text_pub = nh.advertise<std_msgs::String>("/text", 1);
+    // 创建数据发布器（速度、距离、文本信息）
+    ros::Publisher vel_pub = nh.advertise<std_msgs::Float32>("/velocity", 1);    // 速度发布器
+    ros::Publisher dist_pub = nh.advertise<std_msgs::Float32>("/move_dist", 1);  // 移动距离发布器
+    ros::Publisher text_pub = nh.advertise<std_msgs::String>("/text", 1);       // 文本信息发布器
 
+    // 定义数据发布回调函数，用于发布速度、距离和文本信息
     auto data_pub_func = std::function<bool(std::string & topic_name, double time1, std::string time2)>(
         [&](std::string &topic_name, double time1, std::string time2)
         {
-            std_msgs::Float32 time_rviz;
-            std_msgs::String text_msg;
+            std_msgs::Float32 time_rviz;  // 用于RViz显示的浮点数消息
+            std_msgs::String text_msg;    // 文本消息
 
-            text_msg.data = time2;
-            time_rviz.data = time1;
+            text_msg.data = time2;        // 设置文本内容
+            time_rviz.data = time1;       // 设置数值数据
+            
+            // 根据话题名称发布相应的数据
             if (topic_name == "velocity")
-                vel_pub.publish(time_rviz);
+                vel_pub.publish(time_rviz);   // 发布速度信息
             else
-                dist_pub.publish(time_rviz);
+                dist_pub.publish(time_rviz);  // 发布距离信息
 
-            if (topic_name == "text") text_pub.publish(text_msg);
+            if (topic_name == "text") 
+                text_pub.publish(text_msg);   // 发布文本信息
 
             return true;
         }
-
     );
 
-    lio->setFunc(cloud_pub_func);
-    lio->setFunc(pose_pub_func);
-    lio->setFunc(data_pub_func);
-    lio->setFunc(image_pub_func);
+    // 将所有回调函数注册到激光雷达里程计对象中
+    lio->setFunc(cloud_pub_func);  // 设置点云发布函数
+    lio->setFunc(pose_pub_func);   // 设置位姿发布函数
+    lio->setFunc(data_pub_func);   // 设置数据发布函数
+    lio->setFunc(image_pub_func);  // 设置图像发布函数
 
+    // 创建并初始化点云转换对象
     convert = new zjloc::CloudConvert;
     convert->LoadFromYAML(config_file);
     std::cout << ANSI_COLOR_GREEN_BOLD << "init successful" << ANSI_COLOR_RESET << std::endl;
 
+    // 从配置文件中读取话题名称
     auto yaml = YAML::LoadFile(config_file);
-    std::string laser_topic = yaml["common"]["lid_topic"].as<std::string>();
-    std::string imu_topic = yaml["common"]["imu_topic"].as<std::string>();
-    std::string image_topic = yaml["common"]["img_topic"].as<std::string>();
+    std::string laser_topic = yaml["common"]["lid_topic"].as<std::string>();  // 激光雷达话题
+    std::string imu_topic = yaml["common"]["imu_topic"].as<std::string>();    // IMU话题
+    std::string image_topic = yaml["common"]["img_topic"].as<std::string>();  // 图像话题
 
+    // 根据激光雷达类型创建相应的订阅器
     ros::Subscriber subLaserCloud = convert->lidar_type_ == zjloc::CloudConvert::LidarType::AVIA
-                                        ? nh.subscribe(laser_topic, 100, livox_pcl_cbk)
-                                        : nh.subscribe<sensor_msgs::PointCloud2>(laser_topic, 100, standard_pcl_cbk2);
+                                        ? nh.subscribe(laser_topic, 100, livox_pcl_cbk)        // Livox AVIA激光雷达
+                                        : nh.subscribe<sensor_msgs::PointCloud2>(laser_topic, 100, standard_pcl_cbk2);  // 标准点云格式
 
+    // 订阅IMU数据
     ros::Subscriber sub_imu_ori = nh.subscribe<sensor_msgs::Imu>(imu_topic, 500, imuHandler);
 
+    // 订阅状态切换命令
     ros::Subscriber sub_type = nh.subscribe<std_msgs::Int32>("/change_status", 2, updateStatus);
 
+    // 订阅VINS里程计数据，使用Lambda表达式作为回调函数
     ros::Subscriber subOdom = nh.subscribe<nav_msgs::Odometry>(
                               "/vins/odometry/imu_propagate_ros", 
                               2000, 
                               [lio](const nav_msgs::Odometry::ConstPtr& msg){
-                                lio->pushData(msg);
+                                lio->pushData(msg);  // 将里程计数据推送给激光雷达里程计处理器
                               }, 
-                              ros::TransportHints().tcpNoDelay());
+                              ros::TransportHints().tcpNoDelay());  // 设置TCP无延迟传输
 
+    // 订阅压缩图像数据
     ros::Subscriber sub_image = nh.subscribe( image_topic, 200, compressed_image_cbk);
 
+    // 创建并启动激光雷达里程计处理线程
     std::thread measurement_process(&zjloc::lidarodom::run, lio);
 
+    // 开始ROS事件循环，等待消息回调
     ros::spin();
 
-    zjloc::common::Timer::PrintAll();
-    zjloc::common::Timer::DumpIntoFile(DEBUG_FILE_DIR("log_time.txt"));
+    // 程序结束时的清理工作
+    zjloc::common::Timer::PrintAll();                                    // 打印所有计时器统计信息
+    zjloc::common::Timer::DumpIntoFile(DEBUG_FILE_DIR("log_time.txt")); // 将计时信息保存到文件
 
     std::cout << ANSI_COLOR_GREEN_BOLD << " out done. " << ANSI_COLOR_RESET << std::endl;
 
-    sleep(3);
-    return 0;
+    sleep(3);  // 等待3秒钟让其他线程完成
+    return 0;  // 正常退出
 }

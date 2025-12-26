@@ -720,79 +720,118 @@ T readParam(ros::NodeHandle &n, std::string name)
     return ans;
 }
 
+/**
+ * [功能描述]：VINS估计器主程序入口，初始化多传感器融合SLAM系统
+ * @param argc：命令行参数个数
+ * @param argv：命令行参数数组，其中argv[1]应为配置文件路径
+ * @return 程序退出状态码，0表示正常退出，1表示参数错误
+ */
 int main(int argc, char **argv)
 {
+    // 初始化ROS节点，节点名称为"vins_estimator"
     ros::init(argc, argv, "vins_estimator");
+    // 创建私有节点句柄，使用"~"前缀
     ros::NodeHandle n("~");
+    // 设置ROS日志级别为Info，用于控制日志输出详细程度
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
 
+    // 检查命令行参数数量，必须提供配置文件路径
     if (argc != 2)
     {
+        // 参数不正确时输出使用说明
         printf("please intput: rosrun vins vins_node [config file] \n"
                "for example: rosrun vins vins_node "
                "~/catkin_ws/src/VINS-Fusion/config/euroc/euroc_stereo_imu_config.yaml \n");
-        return 1;
+        return 1;  // 返回错误代码
     }
+    
+    // 获取配置文件路径
     string config_file = argv[1];
     printf("config_file: %s\n", argv[1]);
 
     /*
+    // 被注释掉的从ROS参数服务器读取配置文件的方式
     std::string config_file;
     config_file = readParam<std::string>(n, "config_file");
     cout << "config_file: "<< config_file <<endl;
-*/
+    */
+    
+    // 从配置文件中读取系统参数
     readParameters(config_file);
+    // 设置估计器参数，初始化VINS系统
     estimator.setParameter();
 
+    // 检查是否禁用了Eigen库的并行化
 #ifdef EIGEN_DONT_PARALLELIZE
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
 
+    // 输出等待传感器数据的提示信息
     ROS_WARN("waiting for image and imu...");
 
+    // 注册所有的ROS发布器
     registerPub(n);
     
+    // 设置传输提示选项，用于优化网络传输
     ros::TransportHints hints;
+    
+    // 被注释掉的固定订阅器创建方式
     // ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 5000, imu_callback, ros::TransportHints().tcpNoDelay()); // 2000
     // ros::Subscriber sub_wheel = n.subscribe(WHEEL_TOPIC, 5000, wheel_callback, ros::TransportHints().tcpNoDelay());
+    
+    // 根据配置决定是否启用TCP无延迟传输
     if (USE_TCP_NODELAY) hints.tcpNoDelay();
-    ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 5000, imu_callback, hints);
-    ros::Subscriber sub_wheel = n.subscribe(WHEEL_TOPIC, 5000, wheel_callback, hints);
-    // ros::Subscriber sub_feature = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
-    ros::Subscriber sub_img0 = n.subscribe(IMAGE0_TOPIC, 100, img0_callback);
-    ros::Subscriber sub_img1 = n.subscribe(IMAGE1_TOPIC, 100, img1_callback);
-    ros::Subscriber sub_box = n.subscribe("/darknet_ros/bounding_boxes", 100, box_callback);
-    // sleep(0.2);//for time sync
+    
+    // 创建各种传感器数据订阅器
+    ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 5000, imu_callback, hints);          // IMU数据订阅器，缓冲区大小5000
+    ros::Subscriber sub_wheel = n.subscribe(WHEEL_TOPIC, 5000, wheel_callback, hints);   // 轮式里程计订阅器
+    // ros::Subscriber sub_feature = n.subscribe("/feature_tracker/feature", 2000, feature_callback);  // 被注释的特征点订阅器
+    ros::Subscriber sub_img0 = n.subscribe(IMAGE0_TOPIC, 100, img0_callback);            // 左目图像订阅器
+    ros::Subscriber sub_img1 = n.subscribe(IMAGE1_TOPIC, 100, img1_callback);            // 右目图像订阅器
+    ros::Subscriber sub_box = n.subscribe("/darknet_ros/bounding_boxes", 100, box_callback);  // YOLO目标检测边界框订阅器
+    // sleep(0.2);//for time sync  // 被注释的时间同步延迟
 
-    // gnss new
-
-    ros::Subscriber sub_ephem, sub_glo_ephem, sub_gnss_meas, sub_gnss_iono_params;
-    ros::Subscriber sub_gnss_time_pluse_info, sub_local_trigger_info;
+    // GNSS相关订阅器声明
+    ros::Subscriber sub_ephem, sub_glo_ephem, sub_gnss_meas, sub_gnss_iono_params;    // GNSS星历、测量值、电离层参数订阅器
+    ros::Subscriber sub_gnss_time_pluse_info, sub_local_trigger_info;                 // GNSS时间脉冲和本地触发信息订阅器
+    
+    // 如果启用了GNSS功能，创建GNSS相关的订阅器
     if (GNSS_ENABLE)
     {
-        sub_ephem = n.subscribe(GNSS_EPHEM_TOPIC, 100, gnss_ephem_callback);
-        sub_glo_ephem = n.subscribe(GNSS_GLO_EPHEM_TOPIC, 100, gnss_glo_ephem_callback);
-        sub_gnss_meas = n.subscribe(GNSS_MEAS_TOPIC, 100, gnss_meas_callback);
-        sub_gnss_iono_params = n.subscribe(GNSS_IONO_PARAMS_TOPIC, 100, gnss_iono_params_callback);
+        // 创建各种GNSS数据订阅器
+        sub_ephem = n.subscribe(GNSS_EPHEM_TOPIC, 100, gnss_ephem_callback);                    // GPS星历数据
+        sub_glo_ephem = n.subscribe(GNSS_GLO_EPHEM_TOPIC, 100, gnss_glo_ephem_callback);        // GLONASS星历数据
+        sub_gnss_meas = n.subscribe(GNSS_MEAS_TOPIC, 100, gnss_meas_callback);                  // GNSS原始测量数据
+        sub_gnss_iono_params = n.subscribe(GNSS_IONO_PARAMS_TOPIC, 100, gnss_iono_params_callback);  // 电离层参数
 
+        // 如果启用了GNSS本地在线同步功能
         if (GNSS_LOCAL_ONLINE_SYNC)
         {
+            // 订阅GNSS时间脉冲信息，用于精确时间同步
             sub_gnss_time_pluse_info = n.subscribe(GNSS_TP_INFO_TOPIC, 100,
                                                    gnss_tp_info_callback);
+            // 订阅本地触发信息，用于同步本地传感器和GNSS时间
             sub_local_trigger_info = n.subscribe(LOCAL_TRIGGER_INFO_TOPIC, 100,
                                                  local_trigger_info_callback);
+            // 设置GNSS与本地时间差
             time_diff_gnss_local = GNSS_LOCAL_TIME_DIFF;
         }
         else
         {
+            // 如果不使用在线同步，直接设置固定的时间差
             time_diff_gnss_local = GNSS_LOCAL_TIME_DIFF;
+            // 将时间差信息输入到估计器中
             estimator.inputGNSSTimeDiff(time_diff_gnss_local);
+            // 标记时间差为有效
             time_diff_valid = true;
         }
     }
 
+    // 创建并启动数据同步处理线程，负责多传感器数据的时间同步和融合
     std::thread sync_thread{sync_process};
+    
+    // 开始ROS事件循环，等待并处理传感器数据回调
     ros::spin();
 
-    return 0;
+    return 0;  // 程序正常退出
 }

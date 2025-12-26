@@ -321,33 +321,60 @@ void Estimator::inputImagewithline(double t, const cv::Mat &_img, const cv::Mat 
     }
 }
 
+/**
+ * [功能描述]：处理输入的IMU数据，包括数据缓存、快速预测和里程计发布
+ * @param t：IMU数据的时间戳，单位为秒
+ * @param linearAcceleration：三轴线性加速度向量，单位为m/s²
+ * @param angularVelocity：三轴角速度向量，单位为rad/s
+ * @return 无返回值
+ */
 void Estimator::inputIMU(double t, const Vector3d &linearAcceleration, const Vector3d &angularVelocity)
 {
+    // 加锁保护IMU数据缓冲区，确保多线程安全
     mBuf.lock();
+    // 将加速度数据和时间戳组成pair压入加速度缓冲区
     accBuf.push(make_pair(t, linearAcceleration));
+    // 将角速度数据和时间戳组成pair压入角速度缓冲区
     gyrBuf.push(make_pair(t, angularVelocity));
-    // printf("input imu with time %f \n", t);
+    // printf("input imu with time %f \n", t);  // 被注释的调试输出
+    // 解锁IMU数据缓冲区
     mBuf.unlock();
 
+    // 基于当前IMU数据进行快速状态预测，更新latest_P, latest_Q, latest_V等状态量
     fastPredictIMU(t, linearAcceleration, angularVelocity);
+    
+    // 当求解器处于非线性优化状态时，发布最新的里程计信息
     if (solver_flag == NON_LINEAR)
     {
+        // 发布最新的位置、姿态、速度里程计信息到ROS话题
         pubLatestOdometry(latest_P, latest_Q, latest_V, t);
-        // my new for visualization
+        
+        // 为可视化准备ROS消息头
         std_msgs::Header header;
-        header.frame_id = "world";
-        header.stamp = ros::Time(t);
+        header.frame_id = "world";              // 设置坐标系为世界坐标系
+        header.stamp = ros::Time(t);            // 设置时间戳
+        
+        // 发布IMU预积分的可视化信息
         pubIMUPreintegration(latest_P, latest_Q, header);
     }
 
-    Eigen::Quaterniond q;
-    Eigen::Vector3d p;
-    Eigen::Vector3d v;
+    // 声明用于纯IMU预测的变量
+    Eigen::Quaterniond q;  // 预测的四元数姿态
+    Eigen::Vector3d p;     // 预测的位置
+    Eigen::Vector3d v;     // 预测的速度
+    
+    // 进行纯IMU预测，不依赖视觉信息，仅基于IMU数据进行状态传播
     fastPredictPureIMU(t, linearAcceleration, angularVelocity, p, q, v);
+    
+    // 发布纯IMU预测的里程计信息
     pubLatestPureOdometry(p, q, v, t);
+    
+    // 为纯IMU预积分可视化准备ROS消息头
     std_msgs::Header header;
-    header.frame_id = "world";
-    header.stamp = ros::Time(t);
+    header.frame_id = "world";              // 设置坐标系为世界坐标系
+    header.stamp = ros::Time(t);            // 设置时间戳
+    
+    // 发布纯IMU预积分的可视化信息
     pubPureIMUPreintegration(p, q, header);
 }
 
@@ -4091,50 +4118,91 @@ void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Ei
     // cout<<"v1 change:"<<dt * un_acc<<endl;
 }
 
+/**
+ * [功能描述]：基于纯IMU数据进行快速状态预测，不依赖视觉信息，仅使用IMU进行递推估计
+ * @param t：当前IMU数据的时间戳，单位为秒
+ * @param linear_acceleration：当前时刻的三轴线性加速度，单位为m/s²
+ * @param angular_velocity：当前时刻的三轴角速度，单位为rad/s
+ * @param P：输出参数，预测的位置向量（引用传递）
+ * @param Q：输出参数，预测的姿态四元数（引用传递）
+ * @param V：输出参数，预测的速度向量（引用传递）
+ * @return 无返回值
+ */
 void Estimator::fastPredictPureIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity, Eigen::Vector3d &P, Eigen::Quaterniond &Q, Eigen::Vector3d &V)
 {
+    // 静态变量：标记是否为第一次运行，用于初始化
     static bool first_timex = false;
-    static Eigen::Quaterniond Q_latestx(1, 0, 0, 0);
-    static Eigen::Vector3d V_latestx = Eigen::Vector3d::Zero();
-    static Eigen::Vector3d P_latestx = Eigen::Vector3d::Zero();
-    static Eigen::Vector3d acc_0x = Eigen::Vector3d::Zero();
-    static Eigen::Vector3d gyr_0x = Eigen::Vector3d::Zero();
-    static double t_latestx;
+    
+    // 静态变量：保存上一时刻的状态量，用于IMU递推计算
+    static Eigen::Quaterniond Q_latestx(1, 0, 0, 0);    // 上一时刻的姿态四元数，初始化为单位四元数
+    static Eigen::Vector3d V_latestx = Eigen::Vector3d::Zero();  // 上一时刻的速度向量
+    static Eigen::Vector3d P_latestx = Eigen::Vector3d::Zero();  // 上一时刻的位置向量
+    static Eigen::Vector3d acc_0x = Eigen::Vector3d::Zero();     // 上一时刻的加速度测量值
+    static Eigen::Vector3d gyr_0x = Eigen::Vector3d::Zero();     // 上一时刻的角速度测量值
+    static double t_latestx;                                     // 上一时刻的时间戳
+    
+    // 第一次运行时的初始化过程
     if (!first_timex)
     {
-        first_timex = true;
-        Q_latestx = latest_Q;
-        V_latestx = latest_V;
-        P_latestx = latest_P;
-        acc_0x = latest_acc_0;
-        gyr_0x = latest_gyr_0;
-        t_latestx = latest_time;
+        first_timex = true;  // 标记已经初始化
+        
+        // 使用估计器中的最新状态初始化纯IMU预测的起始状态
+        Q_latestx = latest_Q;      // 初始姿态四元数
+        V_latestx = latest_V;      // 初始速度
+        P_latestx = latest_P;      // 初始位置
+        acc_0x = latest_acc_0;     // 初始加速度偏置校正后的值
+        gyr_0x = latest_gyr_0;     // 初始角速度偏置校正后的值
+        t_latestx = latest_time;   // 初始时间戳
+        
+        // 输出初始化信息，用于调试
         std::cout << "fastPredictPureimu initial pose: \n"
-                  << P_latestx.transpose() << std::endl
-                  << Q_latestx.coeffs().transpose() << std::endl;
+                  << P_latestx.transpose() << std::endl      // 输出初始位置
+                  << Q_latestx.coeffs().transpose() << std::endl;  // 输出初始四元数系数
     }
 
+    // 计算时间间隔
     double dt = t - t_latestx;
-    t_latestx = t;
-    Eigen::Vector3d un_acc_0 = Q_latestx * (acc_0x - latest_Ba) - g;
-    Eigen::Vector3d un_gyr = 0.5 * (gyr_0x + angular_velocity) - latest_Bg;
-    Q_latestx = Q_latestx * Utility::deltaQ(un_gyr * dt);
-    Eigen::Vector3d un_acc_1 = Q_latestx * (linear_acceleration - latest_Ba) - g;
-    Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
-    P_latestx = P_latestx + dt * V_latestx + 0.5 * dt * dt * un_acc;
-    V_latestx = V_latestx + dt * un_acc;
-    // cout<<"v latest:"<<V_latestx<<endl;
-    // cout<<"un acc:"<<un_acc<<endl;
-    // cout<<"dt:"<<dt<<endl;
-    // cout<<"v dt:"<<dt * V_latestx<<endl;
-    // cout<<"p change:"<<dt * V_latestx + 0.5 * dt * dt * un_acc<<endl;
-    // cout<<"v change:"<<dt * un_acc<<endl;
-    acc_0x = linear_acceleration;
-    gyr_0x = angular_velocity;
+    t_latestx = t;  // 更新时间戳为当前时刻
 
-    P = P_latestx;
-    Q = Q_latestx;
-    V = V_latestx;
+    // IMU预积分计算过程：
+
+    // 1. 计算上一时刻去偏置后的加速度在世界坐标系下的值
+    Eigen::Vector3d un_acc_0 = Q_latestx * (acc_0x - latest_Ba) - g;
+    
+    // 2. 计算去偏置后的角速度（使用梯形积分的平均值）
+    Eigen::Vector3d un_gyr = 0.5 * (gyr_0x + angular_velocity) - latest_Bg;
+    
+    // 3. 更新姿态四元数：使用角速度积分更新旋转
+    Q_latestx = Q_latestx * Utility::deltaQ(un_gyr * dt);
+    
+    // 4. 计算当前时刻去偏置后的加速度在世界坐标系下的值
+    Eigen::Vector3d un_acc_1 = Q_latestx * (linear_acceleration - latest_Ba) - g;
+    
+    // 5. 使用梯形积分计算平均加速度
+    Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
+    
+    // 6. 更新位置：使用运动学方程 P = P0 + V0*dt + 0.5*a*dt²
+    P_latestx = P_latestx + dt * V_latestx + 0.5 * dt * dt * un_acc;
+    
+    // 7. 更新速度：使用运动学方程 V = V0 + a*dt
+    V_latestx = V_latestx + dt * un_acc;
+    
+    // 被注释掉的调试输出信息
+    // cout<<"v latest:"<<V_latestx<<endl;           // 最新速度
+    // cout<<"un acc:"<<un_acc<<endl;               // 去重力加速度
+    // cout<<"dt:"<<dt<<endl;                       // 时间间隔
+    // cout<<"v dt:"<<dt * V_latestx<<endl;         // 速度项贡献
+    // cout<<"p change:"<<dt * V_latestx + 0.5 * dt * dt * un_acc<<endl;  // 位置变化量
+    // cout<<"v change:"<<dt * un_acc<<endl;        // 速度变化量
+    
+    // 更新上一时刻的IMU测量值，用于下次预测
+    acc_0x = linear_acceleration;  // 保存当前加速度作为下次的"上一时刻"值
+    gyr_0x = angular_velocity;     // 保存当前角速度作为下次的"上一时刻"值
+
+    // 将计算结果赋值给输出参数
+    P = P_latestx;  // 输出预测的位置
+    Q = Q_latestx;  // 输出预测的姿态
+    V = V_latestx;  // 输出预测的速度
 }
 
 // 中值积分Wheel航迹解算new
